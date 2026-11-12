@@ -9,7 +9,16 @@ if (-not (Test-Path $src)) { throw "Build first: cargo build --release" }
 $dir = Join-Path $env:LOCALAPPDATA 'Programs\ProtoPDF'
 $exe = Join-Path $dir 'ProtoPDF.exe'
 New-Item -ItemType Directory -Force $dir | Out-Null
-Copy-Item $src $exe -Force
+# A running copy cannot be overwritten, but it can be renamed: open windows keep working
+# from the old file and the next start uses the new one.
+$old = Join-Path $dir 'ProtoPDF.old.exe'
+Remove-Item $old -Force -ErrorAction SilentlyContinue
+try {
+    Copy-Item $src $exe -Force
+} catch {
+    Move-Item $exe $old -Force
+    Copy-Item $src $exe -Force
+}
 
 $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'ProtoPDF.lnk'
 $shell = New-Object -ComObject WScript.Shell

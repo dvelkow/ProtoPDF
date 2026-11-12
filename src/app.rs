@@ -4,6 +4,7 @@ use crate::edit::{self, Op};
 use crate::print;
 use crate::register;
 use crate::render::{Job, Kind, OpenError, Out, Pool};
+use crate::sign::{self, Level, SigInfo};
 use crate::text::{PageText, lower_chars};
 use eframe::egui::{
     self, Align, Align2, Color32, CursorIcon, FontId, Key, Layout as UiLayout, Modifiers, Pos2,
@@ -25,6 +26,9 @@ const THUMB_PANEL: f32 = 150.0;
 const TEX_BUDGET: usize = 420 << 20;
 const ZOOMS: [f32; 16] =
     [0.25, 0.33, 0.5, 0.67, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 6.0];
+/// Size of a visible signature, in points.
+const SIG_W: f32 = 190.0;
+const SIG_H: f32 = 48.0;
 const TEXT_COLORS: [(&str, [f32; 3]); 3] =
     [("Black", [0.0, 0.0, 0.0]), ("Blue", [0.05, 0.2, 0.75]), ("Red", [0.8, 0.05, 0.05])];
 
@@ -39,6 +43,7 @@ enum Fit {
 enum Tool {
     Select,
     AddText,
+    PlaceSig,
 }
 
 struct PageTex {
@@ -118,7 +123,19 @@ struct TextDraft {
     screen: Pos2,
 }
 
+/// A signature being set up: where it goes and what it says.
+struct SignDraft {
+    page: usize,
+    x: f32,
+    y: f32,
+    visible: bool,
+    reason: String,
+    location: String,
+    screen: Pos2,
+}
+
 enum EditDone {
+    Signed(Result<Vec<u8>, String>, PathBuf),
     Replace(Result<Vec<u8>, String>, Option<usize>, &'static str),
     Export(Result<(), String>, PathBuf),
 }
@@ -149,6 +166,10 @@ enum Act {
     Extract(Vec<usize>),
     ToolAddText,
     AddText,
+    ToolSign,
+    SignGo,
+    ShowSigs,
+    EditSigned(bool),
     ToggleThumbs,
     MakeDefault,
     Password(Option<String>),
@@ -228,6 +249,14 @@ pub struct App {
     shot_wait: u32,
     /// Steps from `--do`, run one at a time once the view has settled (for automated checks).
     script: Vec<String>,
+    /// Digital signatures found in the open document, already checked.
+    sigs: Vec<SigInfo>,
+    sig_rx: Option<Receiver<(Arc<Vec<u8>>, Vec<SigInfo>)>>,
+    show_sigs: bool,
+    sign_draft: Option<SignDraft>,
+    /// The user agreed to change a signed document.
+    edit_signed_ok: bool,
+    pending_edit: Option<(Op, Option<usize>, &'static str)>,
 }
 
 impl App {
@@ -268,6 +297,12 @@ impl App {
             shot,
             shot_wait: 0,
             script: Vec::new(),
+            sigs: Vec::new(),
+            sig_rx: None,
+            show_sigs: false,
+            sign_draft: None,
+            edit_signed_ok: false,
+            pending_edit: None,
         };
         // Switches used when taking automated screenshots.
         let args: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
@@ -321,9 +356,34 @@ impl App {
                 self.tool = Tool::Select;
                 self.reset_search();
                 self.status.clear();
+                self.sign_draft = None;
+                self.edit_signed_ok = false;
+                self.pending_edit = None;
+                self.show_sigs = false;
+                self.check_signatures(ctx);
             }
             Err(e) => self.error = Some(format!("Cannot open {}\n{e}", path.display())),
         }
+    }
+
+    /// Look for digital signatures in the current bytes and check them, off the UI thread.
+    fn check_signatures(&mut self, ctx: &egui::Context) {
+        self.sigs.clear();
+        self.sig_rx = None;
+        let Some(doc) = &self.doc else { return };
+        let bytes = doc.bytes.clone();
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let sigs = if sign::has_signature_marker(&bytes) {
+                std::panic::catch_unwind(|| sign::verify_all(&bytes)).unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+            let _ = tx.send((bytes, sigs));
+            ctx.request_repaint();
+        });
+        self.sig_rx = Some(rx);
     }
 
     fn reset_search(&mut self) {
@@ -342,7 +402,9 @@ impl App {
         doc.loaded = false;
         self.sel = None;
         self.draft = None;
+        self.sign_draft = None;
         self.reset_search();
+        self.check_signatures(ctx);
         match jump {
             Some(p) => self.jump = Some(p),
             None => self.set_scroll = Some(self.scroll),
@@ -421,10 +483,36 @@ impl App {
             None => {}
         }
 
+        if let Some(rx) = &self.sig_rx {
+            if let Ok((bytes, sigs)) = rx.try_recv() {
+                self.sig_rx = None;
+                if self.doc.as_ref().is_some_and(|d| Arc::ptr_eq(&d.bytes, &bytes)) {
+                    self.sigs = sigs;
+                }
+            }
+        }
+
         if let Some(rx) = &self.edit_rx {
             if let Ok(done) = rx.try_recv() {
                 self.edit_rx = None;
                 match done {
+                    EditDone::Signed(Ok(bytes), path) => {
+                        // The signed file is on disk already: it becomes the open document.
+                        let snap = Arc::new(bytes);
+                        if let Some(doc) = self.doc.as_mut() {
+                            doc.undo.clear();
+                            doc.redo.clear();
+                            doc.saved = snap.clone();
+                            doc.path = Some(path.clone());
+                        }
+                        self.replace(ctx, (snap, String::new()), None);
+                        self.edit_signed_ok = false;
+                        self.status = format!("Signed and saved as {}", path.display());
+                    }
+                    EditDone::Signed(Err(e), _) => {
+                        self.status.clear();
+                        self.error = Some(e);
+                    }
                     EditDone::Replace(Ok(bytes), jump, label) => {
                         if let Some(doc) = self.doc.as_mut() {
                             doc.undo.push((doc.bytes.clone(), doc.password.clone()));
@@ -581,6 +669,11 @@ impl App {
     fn run_edit(&mut self, ctx: &egui::Context, op: Op, jump: Option<usize>, label: &'static str) {
         let Some(doc) = &self.doc else { return };
         if self.busy() || !doc.loaded {
+            return;
+        }
+        if !self.sigs.is_empty() && !self.edit_signed_ok {
+            // Any change breaks the signatures, so ask first.
+            self.pending_edit = Some((op, jump, label));
             return;
         }
         let (bytes, password) = (doc.bytes.clone(), doc.password.clone());
@@ -887,13 +980,69 @@ impl App {
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
             }
+            Act::ToolSign => {
+                self.tool = if self.tool == Tool::PlaceSig { Tool::Select } else { Tool::PlaceSig };
+                self.sign_draft = None;
+                self.draft = None;
+                if self.tool == Tool::PlaceSig {
+                    self.status = "Click on the page where the signature should appear".into();
+                }
+            }
+            Act::SignGo => {
+                let (Some(d), Some(doc)) = (self.sign_draft.as_ref(), self.doc.as_ref()) else { return };
+                if self.busy() || !doc.loaded {
+                    return;
+                }
+                let cert = match sign::pick_certificate() {
+                    Ok(Some(cert)) => cert,
+                    Ok(None) => return,
+                    Err(e) => {
+                        self.error = Some(e);
+                        return;
+                    }
+                };
+                let options = sign::SignOptions {
+                    page: d.page,
+                    rect: d.visible.then(|| [d.x, d.y, d.x + SIG_W, d.y + SIG_H]),
+                    reason: d.reason.clone(),
+                    location: d.location.clone(),
+                };
+                let bytes = doc.bytes.clone();
+                let Some(path) = self.save_as_dialog("-signed") else { return };
+                let (tx, rx) = channel();
+                let ctx = ctx.clone();
+                let target = path.clone();
+                std::thread::spawn(move || {
+                    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sign::sign_pdf(&bytes, &cert, &options)))
+                        .unwrap_or_else(|_| Err("This PDF could not be signed.".into()))
+                        .and_then(|out| {
+                            std::fs::write(&target, &out).map_err(|e| format!("Cannot save {}\n{e}", target.display()))?;
+                            Ok(out)
+                        });
+                    let _ = tx.send(EditDone::Signed(res, target));
+                    ctx.request_repaint();
+                });
+                self.edit_rx = Some(rx);
+                self.sign_draft = None;
+                self.tool = Tool::Select;
+                self.status = "Signing... Windows may ask for the PIN of your signature".into();
+            }
+            Act::ShowSigs => self.show_sigs = !self.show_sigs,
+            Act::EditSigned(yes) => {
+                if let Some((op, jump, label)) = self.pending_edit.take() {
+                    if yes {
+                        self.edit_signed_ok = true;
+                        self.run_edit(ctx, op, jump, label);
+                    }
+                }
+            }
             Act::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
         }
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
         let typing = ctx.egui_wants_keyboard_input();
-        let modal = self.password.is_some() || self.error.is_some() || self.confirm_close || self.extract.is_some();
+        let modal = self.password.is_some() || self.error.is_some() || self.confirm_close || self.extract.is_some() || self.pending_edit.is_some();
         let hit = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
         let ctrl = Modifiers::COMMAND;
         let ctrl_shift = Modifiers::COMMAND | Modifiers::SHIFT;
@@ -951,8 +1100,9 @@ impl App {
             acts.push(Act::FindNext(false));
         }
         if hit(Modifiers::NONE, Key::Escape) {
-            if self.draft.is_some() || self.tool == Tool::AddText {
+            if self.draft.is_some() || self.sign_draft.is_some() || self.tool != Tool::Select {
                 self.draft = None;
+                self.sign_draft = None;
                 self.tool = Tool::Select;
             } else if self.search.open {
                 self.search.open = false;
@@ -965,7 +1115,7 @@ impl App {
             acts.push(Act::Zoom(self.zoom * zoom));
         }
 
-        if typing || self.draft.is_some() {
+        if typing || self.draft.is_some() || self.sign_draft.is_some() {
             return;
         }
         if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) {
@@ -1109,6 +1259,19 @@ impl App {
                         acts.push(Act::ExtractDialog);
                     }
                 });
+                ui.menu_button("Signatures", |ui| {
+                    if item(ui, has && !self.busy(), "Sign this document...", "") {
+                        acts.push(Act::ToolSign);
+                    }
+                    let label = match self.sigs.len() {
+                        0 => "This document is not signed".to_string(),
+                        1 => "Show the signature".to_string(),
+                        n => format!("Show the {n} signatures"),
+                    };
+                    if item(ui, !self.sigs.is_empty(), &label, "") {
+                        acts.push(Act::ShowSigs);
+                    }
+                });
                 ui.menu_button("View", |ui| {
                     if item(ui, has, "Zoom in", "Ctrl++") {
                         acts.push(Act::ZoomStep(true));
@@ -1212,6 +1375,13 @@ impl App {
                 if ui.add_enabled(can_undo && edit_ok, egui::Button::new("Undo")).on_hover_text("Undo (Ctrl+Z)").clicked() {
                     acts.push(Act::Undo);
                 }
+                if ui
+                    .add_enabled(has && !self.busy(), egui::Button::selectable(self.tool == Tool::PlaceSig, "Sign"))
+                    .on_hover_text("Sign with your digital signature")
+                    .clicked()
+                {
+                    acts.push(Act::ToolSign);
+                }
                 ui.separator();
                 if ui.add_enabled(has, egui::Button::selectable(self.search.open, "Find")).on_hover_text("Find text (Ctrl+F)").clicked() {
                     if self.search.open {
@@ -1223,6 +1393,24 @@ impl App {
             });
             ui.add_space(3.0);
         });
+
+        if !self.sigs.is_empty() && has {
+            let (level, text) = sign::summary(&self.sigs);
+            let fill = match level {
+                Level::Good => Color32::from_rgb(28, 98, 56),
+                Level::Warn => Color32::from_rgb(138, 96, 10),
+                Level::Bad => Color32::from_rgb(150, 36, 36),
+            };
+            egui::Panel::top("sigbar").frame(egui::Frame::NONE.fill(fill).inner_margin(egui::Margin::symmetric(8, 5))).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.visuals_mut().override_text_color = Some(Color32::WHITE);
+                    if ui.button("Details").clicked() {
+                        acts.push(Act::ShowSigs);
+                    }
+                    ui.add(egui::Label::new(egui::RichText::new(text).color(Color32::WHITE)).truncate());
+                });
+            });
+        }
 
         if self.search.open && has {
             egui::Panel::top("find").show(ui, |ui| {
@@ -1424,6 +1612,7 @@ impl App {
             let tool = self.tool;
             let sel = &mut self.sel;
             let draft = &mut self.draft;
+            let sign_draft = &mut self.sign_draft;
             let search = &self.search;
             let jobs = &mut self.jobs_view;
             let mut cur_page = self.cur_page;
@@ -1521,6 +1710,15 @@ impl App {
                             );
                         }
                     }
+
+                    // Where the new signature will sit.
+                    if let Some(d) = sign_draft.as_ref().filter(|d| d.page == i && d.visible) {
+                        let box_rect = Rect::from_min_size(r.min + vec2(d.x, d.y) * lay.ppt, vec2(SIG_W, SIG_H) * lay.ppt);
+                        let blue = Color32::from_rgb(33, 97, 184);
+                        painter.rect_filled(box_rect, 0.0, Color32::from_rgba_unmultiplied(33, 97, 184, 28));
+                        painter.rect_stroke(box_rect, 0.0, Stroke::new(1.5, blue), StrokeKind::Inside);
+                        painter.text(box_rect.center(), Align2::CENTER_CENTER, "Signature", FontId::proportional(11.0 * lay.ppt), blue);
+                    }
                 }
                 // Neighbours are rendered ahead so scrolling does not show blank pages.
                 if loaded {
@@ -1538,6 +1736,35 @@ impl App {
                 let locate = |pos: Pos2| visible.iter().copied().find(|&i| page_rect(i).contains(pos));
                 let in_page = |i: usize, pos: Pos2| (pos - page_rect(i).min) / lay.ppt;
                 match tool {
+                    Tool::PlaceSig => {
+                        if resp.hovered() {
+                            ctx.set_cursor_icon(CursorIcon::Crosshair);
+                        }
+                        if resp.clicked() {
+                            if let Some(pos) = resp.interact_pointer_pos() {
+                                if let Some(i) = locate(pos) {
+                                    // Keep the whole box on the page.
+                                    let p = in_page(i, pos);
+                                    let x = p.x.min(doc.sizes[i].0 - SIG_W - 2.0).max(2.0);
+                                    let y = p.y.min(doc.sizes[i].1 - SIG_H - 2.0).max(2.0);
+                                    match sign_draft.as_mut() {
+                                        Some(d) => (d.page, d.x, d.y) = (i, x, y),
+                                        None => {
+                                            *sign_draft = Some(SignDraft {
+                                                page: i,
+                                                x,
+                                                y,
+                                                visible: true,
+                                                reason: String::new(),
+                                                location: String::new(),
+                                                screen: pos,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
                     Tool::AddText => {
                         if resp.hovered() {
                             ctx.set_cursor_icon(CursorIcon::Crosshair);
@@ -1706,6 +1933,104 @@ impl App {
             }
         }
 
+        if let Some(d) = self.sign_draft.as_mut() {
+            let mut open = true;
+            egui::Window::new("Sign document")
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut open)
+                .default_pos(d.screen + vec2(30.0, 90.0))
+                .show(ctx, |ui| {
+                    ui.set_width(300.0);
+                    ui.checkbox(&mut d.visible, "Show the signature on the page");
+                    if d.visible {
+                        ui.label("Click on the page to move it.");
+                    }
+                    ui.add_space(4.0);
+                    egui::Grid::new("sign_fields").num_columns(2).show(ui, |ui| {
+                        ui.label("Reason");
+                        ui.add(egui::TextEdit::singleline(&mut d.reason).hint_text("optional").desired_width(220.0));
+                        ui.end_row();
+                        ui.label("Place");
+                        ui.add(egui::TextEdit::singleline(&mut d.location).hint_text("optional").desired_width(220.0));
+                        ui.end_row();
+                    });
+                    ui.add_space(6.0);
+                    if ui.button("Choose certificate and sign...").clicked() {
+                        acts.push(Act::SignGo);
+                    }
+                    ui.label("The signed document is saved as a new file.");
+                });
+            if !open {
+                self.sign_draft = None;
+                self.tool = Tool::Select;
+            }
+        }
+
+        if self.show_sigs && !self.sigs.is_empty() {
+            let mut open = true;
+            egui::Window::new("Signatures").collapsible(false).resizable(false).open(&mut open).default_pos(pos2(90.0, 150.0)).show(ctx, |ui| {
+                ui.set_width(430.0);
+                for (i, s) in self.sigs.iter().enumerate() {
+                    if i > 0 {
+                        ui.separator();
+                    }
+                    let color = match s.level() {
+                        Level::Good => Color32::from_rgb(60, 170, 95),
+                        Level::Warn => Color32::from_rgb(214, 160, 40),
+                        Level::Bad => Color32::from_rgb(225, 80, 80),
+                    };
+                    let title = if s.is_timestamp {
+                        "Document timestamp".to_string()
+                    } else if s.org.is_empty() || s.org == s.signer {
+                        s.signer.clone()
+                    } else {
+                        format!("{} ({})", s.signer, s.org)
+                    };
+                    ui.label(egui::RichText::new(title).strong().size(15.0));
+                    ui.colored_label(color, &s.intact_msg);
+                    if !s.trust_msg.is_empty() {
+                        ui.colored_label(if s.trusted { color } else { Color32::from_rgb(214, 160, 40) }, &s.trust_msg);
+                    }
+                    if !s.is_timestamp && !s.signed_at.is_empty() {
+                        ui.label(format!("Signed: {} (time from the signer's computer)", s.signed_at));
+                    }
+                    if let Some(t) = &s.timestamp {
+                        ui.label(format!("Timestamp: {t} (confirmed by a timestamp authority)"));
+                    }
+                    if !s.issuer.is_empty() {
+                        ui.label(format!("Certificate issued by {}, valid until {}", s.issuer, s.cert_until));
+                    }
+                    if !s.reason.is_empty() {
+                        ui.label(format!("Reason: {}", s.reason));
+                    }
+                    if !s.location.is_empty() {
+                        ui.label(format!("Place: {}", s.location));
+                    }
+                }
+            });
+            if !open {
+                self.show_sigs = false;
+            }
+        }
+
+        if self.pending_edit.is_some() {
+            egui::Modal::new(egui::Id::unique("edit_signed")).show(ctx, |ui| {
+                ui.set_width(360.0);
+                ui.heading("This document is signed");
+                ui.label("Changing it makes the digital signatures invalid. The original file stays as it is until you save.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Change it anyway").clicked() {
+                        acts.push(Act::EditSigned(true));
+                    }
+                    if ui.button("Cancel").clicked() {
+                        acts.push(Act::EditSigned(false));
+                    }
+                });
+            });
+        }
+
         if self.confirm_close {
             let name = self.doc.as_ref().map(|d| d.name()).unwrap_or_default();
             egui::Modal::new(egui::Id::unique("close")).show(ctx, |ui| {
@@ -1773,7 +2098,7 @@ impl App {
         }
         ctx.request_repaint();
         let settled = match &self.doc {
-            Some(d) => d.loaded && !d.pool.busy() && !self.busy(),
+            Some(d) => d.loaded && !d.pool.busy() && !self.busy() && self.sig_rx.is_none(),
             None => true,
         };
         self.shot_wait = if settled { self.shot_wait + 1 } else { 0 };
@@ -1819,6 +2144,24 @@ impl App {
             },
             "saveas" => {
                 self.save_to(Path::new(arg));
+                return;
+            }
+            "showsigs" => Act::ShowSigs,
+            "editsigned" => Act::EditSigned(true),
+            "placesig" => {
+                let mut it = arg.split(',');
+                let x = it.next().and_then(|v| v.parse().ok()).unwrap_or(40.0);
+                let y = it.next().and_then(|v| v.parse().ok()).unwrap_or(40.0);
+                self.tool = Tool::PlaceSig;
+                self.sign_draft = Some(SignDraft {
+                    page: self.cur_page,
+                    x,
+                    y,
+                    visible: true,
+                    reason: String::new(),
+                    location: String::new(),
+                    screen: pos2(420.0, 200.0),
+                });
                 return;
             }
             "text" => {

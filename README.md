@@ -20,6 +20,13 @@ Editing
 - Write text on a page, any script, in black, blue or red
 - Undo and redo for every edit. Nothing is written to disk until you press Save
 
+Digital signatures
+- Every signed PDF is checked when it is opened. A coloured bar says whether the document is unchanged and whether the signer is trusted, and Details lists each signature: who signed, when, the issuer, and any trusted timestamp
+- Sign with any certificate in the Windows certificate store, which includes qualified signatures on smart cards and USB tokens. Windows asks for the PIN
+- The signature can be shown on the page (click where it should go) or be invisible
+- Signing appends to the file, so signatures that are already in it stay valid and several people can sign in turn
+- ProtoPDF warns before an edit that would break an existing signature
+
 Printing
 - Print button and Ctrl+P open the Windows print dialog: any installed printer, page range, copies
 - Landscape pages are turned to fill the sheet, oversized pages are shrunk to the printable area
@@ -72,6 +79,8 @@ ProtoPDF.exe file.pdf                      open a file
 ProtoPDF.exe --print file.pdf              print to the default printer, no window
 ProtoPDF.exe --print file.pdf --printer "Microsoft Print to PDF" --output out.pdf
 ProtoPDF.exe --render file.pdf 1 page.png 1200   render page 1 to a PNG 1200 px wide
+ProtoPDF.exe --verify file.pdf             check the signatures and print the result
+ProtoPDF.exe --sign in.pdf out.pdf --thumbprint HEX [--page 1 --rect 330,640,520,688 --reason text --location text]
 ProtoPDF.exe --register                    register as a PDF app and open the Windows default apps page
 ProtoPDF.exe --unregister                  remove the registration
 ```
@@ -84,9 +93,10 @@ ProtoPDF.exe --unregister                  remove the registration
 | Page edits and saving | [lopdf](https://github.com/J-F-Liu/lopdf) |
 | Fonts for added text | [ttf-parser](https://github.com/harfbuzz/ttf-parser) and [subsetter](https://github.com/typst/subsetter) |
 | Window and controls | [egui / eframe](https://github.com/emilk/egui) |
+| Signatures | Windows CryptoAPI through the windows crate: PKCS#7 signing, verification, certificate chains, timestamps |
 | Print dialog, printing, registry | [windows](https://github.com/microsoft/windows-rs), [winreg](https://github.com/gentoo90/winreg-rs) |
 
-Source layout: `src/render.rs` (background render threads), `src/text.rs` (search and selection), `src/edit.rs` (edits), `src/print.rs`, `src/register.rs`, `src/app.rs` (the window).
+Source layout: `src/render.rs` (background render threads), `src/text.rs` (search and selection), `src/edit.rs` (edits), `src/sign.rs` (signatures), `src/print.rs`, `src/register.rs`, `src/app.rs` (the window).
 
 ## Tests
 
@@ -100,6 +110,9 @@ cargo test --release
 ## Limits
 
 - Windows only
-- Filling in PDF form fields, signatures and comments are not supported
+- Filling in PDF form fields and comments are not supported
+- A signer counts as trusted when Windows trusts the issuer of the certificate. The EU trusted list is not consulted, so a qualified signature from an issuer whose root certificate is not installed in Windows shows as "identity could not be confirmed" even though the document check passes
+- New signatures use the adbe.pkcs7.detached format with SHA-256 and the time of this computer. They do not carry a timestamp from a timestamp authority
+- Password protected PDFs cannot be signed
 - Saving an edited file rewrites it without encryption, so a password protected PDF loses its password once edited and saved
 - Pages are printed as 300 dpi images

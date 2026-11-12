@@ -165,7 +165,7 @@ fn flatten(doc: &mut Document) -> Res<(ObjectId, Vec<ObjectId>)> {
     Ok((root, pages))
 }
 
-fn inherited(doc: &Document, page: ObjectId, key: &[u8]) -> Option<Object> {
+pub(crate) fn inherited(doc: &Document, page: ObjectId, key: &[u8]) -> Option<Object> {
     let mut id = page;
     for _ in 0..64 {
         let d = doc.get_dictionary(id).ok()?;
@@ -192,8 +192,9 @@ fn num(o: &Object) -> Option<f32> {
     }
 }
 
-fn rect_of(doc: &Document, page: &Dictionary, key: &[u8]) -> Option<[f32; 4]> {
-    let (_, o) = doc.dereference(page.get(key).ok()?).ok()?;
+fn rect_of(doc: &Document, page: ObjectId, key: &[u8]) -> Option<[f32; 4]> {
+    let value = inherited(doc, page, key)?;
+    let (_, o) = doc.dereference(&value).ok()?;
     let a = o.as_array().ok()?;
     if a.len() != 4 {
         return None;
@@ -205,20 +206,17 @@ fn rect_of(doc: &Document, page: &Dictionary, key: &[u8]) -> Option<[f32; 4]> {
     Some([v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])])
 }
 
-/// The visible box of a page and its rotation.
-fn page_box(doc: &Document, id: ObjectId) -> Res<([f32; 4], i64)> {
-    let page = doc.get_dictionary(id).map_err(err("Page"))?;
-    let media = rect_of(doc, page, b"MediaBox").unwrap_or([0.0, 0.0, 595.0, 842.0]);
-    let crop = rect_of(doc, page, b"CropBox").unwrap_or(media);
+/// The visible box of a page and its rotation (inherited values included).
+pub(crate) fn page_box(doc: &Document, id: ObjectId) -> Res<([f32; 4], i64)> {
+    doc.get_dictionary(id).map_err(err("Page"))?;
+    let media = rect_of(doc, id, b"MediaBox").unwrap_or([0.0, 0.0, 595.0, 842.0]);
+    let crop = rect_of(doc, id, b"CropBox").unwrap_or(media);
     let mut b = [crop[0].max(media[0]), crop[1].max(media[1]), crop[2].min(media[2]), crop[3].min(media[3])];
     if b[2] - b[0] < 1.0 || b[3] - b[1] < 1.0 {
         b = media;
     }
-    let rot = page
-        .get(b"Rotate")
-        .ok()
-        .and_then(|o| doc.dereference(o).ok())
-        .and_then(|(_, o)| o.as_i64().ok())
+    let rot = inherited(doc, id, b"Rotate")
+        .and_then(|o| doc.dereference(&o).ok().and_then(|(_, o)| o.as_i64().ok()))
         .unwrap_or(0)
         .rem_euclid(360);
     Ok((b, rot))
@@ -226,7 +224,7 @@ fn page_box(doc: &Document, id: ObjectId) -> Res<([f32; 4], i64)> {
 
 /// Map a point in viewer coordinates to PDF user space, and give the text
 /// matrix direction that reads left to right on screen.
-fn view_to_user(b: [f32; 4], rot: i64, vx: f32, vy: f32) -> ((f32, f32), [f32; 4]) {
+pub(crate) fn view_to_user(b: [f32; 4], rot: i64, vx: f32, vy: f32) -> ((f32, f32), [f32; 4]) {
     let (x0, y0) = (b[0], b[1]);
     let (w, h) = (b[2] - b[0], b[3] - b[1]);
     match rot {
@@ -237,10 +235,23 @@ fn view_to_user(b: [f32; 4], rot: i64, vx: f32, vy: f32) -> ((f32, f32), [f32; 4
     }
 }
 
-struct EmbeddedFont {
-    id: ObjectId,
+pub(crate) struct EmbeddedFont {
+    pub id: ObjectId,
     /// New glyph id for each character used.
-    gids: BTreeMap<char, u16>,
+    pub gids: BTreeMap<char, u16>,
+    /// Advance of each character, in thousandths of the font size.
+    pub advances: BTreeMap<char, f32>,
+}
+
+impl EmbeddedFont {
+    /// The text as a hex string of glyph ids, ready for `Tj`.
+    pub fn hex(&self, text: &str) -> String {
+        text.chars().map(|c| format!("{:04X}", self.gids.get(&c).copied().unwrap_or(0))).collect()
+    }
+
+    pub fn width(&self, text: &str, size: f32) -> f32 {
+        text.chars().map(|c| self.advances.get(&c).copied().unwrap_or(500.0)).sum::<f32>() * size / 1000.0
+    }
 }
 
 fn add_text(doc: &mut Document, page: ObjectId, x: f32, y: f32, text: &str, size: f32, color: [f32; 3]) -> Res<()> {
@@ -308,7 +319,7 @@ fn add_text(doc: &mut Document, page: ObjectId, x: f32, y: f32, text: &str, size
 
 /// Embed a subset of a Windows font that covers `text` as an Identity-H
 /// composite font, so that any script (Cyrillic included) can be written.
-fn embed_font(doc: &mut Document, text: &str) -> Res<EmbeddedFont> {
+pub(crate) fn embed_font(doc: &mut Document, text: &str) -> Res<EmbeddedFont> {
     let data = ["arial.ttf", "segoeui.ttf", "tahoma.ttf", "verdana.ttf"]
         .iter()
         .find_map(|f| std::fs::read(crate::fonts_dir().join(f)).ok())
@@ -320,6 +331,7 @@ fn embed_font(doc: &mut Document, text: &str) -> Res<EmbeddedFont> {
     let mut remap = subsetter::GlyphRemapper::new();
     remap.remap(0);
     let mut gids = BTreeMap::new();
+    let mut advances = BTreeMap::new();
     let mut widths: BTreeMap<u16, f32> = BTreeMap::new();
     widths.insert(0, face.glyph_hor_advance(ttf_parser::GlyphId(0)).unwrap_or(0) as f32 * k);
     for c in text.chars().filter(|c| *c != '\n') {
@@ -329,7 +341,9 @@ fn embed_font(doc: &mut Document, text: &str) -> Res<EmbeddedFont> {
         let old = face.glyph_index(c).unwrap_or(ttf_parser::GlyphId(0));
         let new = remap.remap(old.0);
         gids.insert(c, new);
-        widths.insert(new, face.glyph_hor_advance(old).unwrap_or(0) as f32 * k);
+        let adv = face.glyph_hor_advance(old).unwrap_or(0) as f32 * k;
+        advances.insert(c, adv);
+        widths.insert(new, adv);
     }
     let subset = subsetter::subset(&data, 0, &remap).map_err(|e| format!("Font subset: {e:?}"))?;
 
@@ -416,7 +430,7 @@ fn embed_font(doc: &mut Document, text: &str) -> Res<EmbeddedFont> {
         "DescendantFonts" => vec![Object::Reference(cid)],
         "ToUnicode" => to_unicode,
     });
-    Ok(EmbeddedFont { id, gids })
+    Ok(EmbeddedFont { id, gids, advances })
 }
 
 #[cfg(test)]
