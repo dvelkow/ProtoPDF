@@ -404,15 +404,16 @@ impl App {
             back: Vec::new(),
             jump_offset: 0.0,
             hover: None,
-            show_panel: settings.panel,
+            // Every file opens with the sidebar shown and the document panel hidden.
+            show_panel: false,
             settings,
             pal,
             sig_hidden: false,
         };
-        // Switches used when taking automated screenshots.
-        app.show_thumbs = app.settings.sidebar || args.iter().any(|a| a == "--thumbs");
-        if args.iter().any(|a| a == "--no-panel") {
-            app.show_panel = false;
+        app.show_thumbs = true;
+        // --panel: start with the document panel open (for screenshots).
+        if args.iter().any(|a| a == "--panel") {
+            app.show_panel = true;
         }
         // The find box is always on screen.
         app.search.open = true;
@@ -1171,13 +1172,9 @@ impl App {
             Act::ToggleThumbs => {
                 self.show_thumbs = !self.show_thumbs;
                 self.thumb_follow = usize::MAX;
-                self.settings.sidebar = self.show_thumbs;
-                self.settings.save();
             }
             Act::TogglePanel => {
                 self.show_panel = !self.show_panel;
-                self.settings.panel = self.show_panel;
-                self.settings.save();
             }
             Act::ToggleTheme => {
                 self.settings.light = !self.settings.light;
@@ -1664,7 +1661,8 @@ impl App {
         let can_undo = self.doc.as_ref().is_some_and(|d| !d.undo.is_empty());
         let can_redo = self.doc.as_ref().is_some_and(|d| !d.redo.is_empty());
         let edit_ok = has && !self.busy();
-        let busy = self.busy() || self.print_rx.is_some();
+        let printing = self.print_rx.is_some();
+        let busy = self.busy() || printing;
         let mut msg = String::new();
         if self.is_dirty() {
             msg.push_str("Edited");
@@ -1712,6 +1710,12 @@ impl App {
                         if theme::icon_button(ui, &p, Icon::PanelRight, 32.0, true, panel_open, tip).clicked() {
                             acts.push(Act::TogglePanel);
                         }
+                        theme::vdivider(ui, &p);
+                    }
+                    if theme::icon_button(ui, &p, Icon::Printer, 32.0, has && !printing, false, "Print (Ctrl+P)").clicked() {
+                        acts.push(Act::Print);
+                    }
+                    if has {
                         theme::vdivider(ui, &p);
                         if theme::icon_button(ui, &p, Icon::Redo, 32.0, can_redo && edit_ok, false, "Redo (Ctrl+Y)").clicked() {
                             acts.push(Act::Redo);
@@ -1779,9 +1783,6 @@ impl App {
             }
             if theme::nav_row(ui, &p, Icon::Search, "Find in document", "Ctrl F", has).clicked() {
                 acts.push(Act::Find);
-            }
-            if theme::nav_row(ui, &p, Icon::Printer, "Print", "Ctrl P", has).clicked() {
-                acts.push(Act::Print);
             }
 
             let footer_h = 46.0;

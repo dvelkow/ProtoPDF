@@ -1,5 +1,6 @@
-//! Preferences kept between runs: the theme, which side panels are open and
-//! the recently opened files. Stored as plain `key=value` lines in
+//! Preferences kept between runs: the theme and the recently opened files.
+//! (The side panels are not remembered: every file opens with the sidebar
+//! shown and the document panel hidden.) Stored as plain `key=value` lines in
 //! `%APPDATA%\ProtoPDF\settings.txt` on Windows and
 //! `~/.config/ProtoPDF/settings.txt` on Linux.
 
@@ -9,8 +10,6 @@ const MAX_RECENT: usize = 8;
 
 pub struct Settings {
     pub light: bool,
-    pub sidebar: bool,
-    pub panel: bool,
     pub recent: Vec<PathBuf>,
     /// False when the theme was forced from the command line: nothing is written then.
     pub persist: bool,
@@ -18,7 +17,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { light: false, sidebar: true, panel: true, recent: Vec::new(), persist: true }
+        Self { light: false, recent: Vec::new(), persist: true }
     }
 }
 
@@ -39,11 +38,8 @@ impl Settings {
         let Some(text) = file().and_then(|f| std::fs::read_to_string(f).ok()) else { return s };
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else { continue };
-            let on = value.trim() == "1";
             match key.trim() {
-                "light" => s.light = on,
-                "sidebar" => s.sidebar = on,
-                "panel" => s.panel = on,
+                "light" => s.light = value.trim() == "1",
                 "recent" if !value.is_empty() && s.recent.len() < MAX_RECENT => s.recent.push(PathBuf::from(value)),
                 _ => {}
             }
@@ -56,8 +52,7 @@ impl Settings {
             return;
         }
         let Some(path) = file() else { return };
-        let flag = |b: bool| if b { "1" } else { "0" };
-        let mut out = format!("light={}\nsidebar={}\npanel={}\n", flag(self.light), flag(self.sidebar), flag(self.panel));
+        let mut out = format!("light={}\n", if self.light { "1" } else { "0" });
         for r in &self.recent {
             if let Some(s) = r.to_str() {
                 out.push_str("recent=");

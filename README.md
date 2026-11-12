@@ -18,11 +18,11 @@ Written entirely in Rust, it opens a 200 page manual in under a second and print
 ## What it does
 
 The window
-- Sidebar on the left: open, find and print, the page list (or contents, or comments) and recently opened files
-- Document panel on the right: page count and size, who signed the document and whether the signature holds, the comments, and unsaved changes with a Save button
+- Sidebar on the left, open whenever a file opens: open and find, the page list (or contents, or comments) and recently opened files
+- Document panel on the right, opened with the button at the top right: page count and size, who signed the document and whether the signature holds, the comments, and unsaved changes with a Save button
 - Find box at the bottom, with page and zoom controls next to it. The signature check sits just above it
-- Tools as icons in the top bar. Every other command is in the menu under the file name
-- Dark and light mode: the sun / moon button at the bottom of the sidebar, or View in the file menu. The mode, the open panels and the recent files are remembered
+- Tools and Print as icons in the top bar. Every other command is in the menu under the file name
+- Dark and light mode: the sun / moon button at the bottom of the sidebar, or View in the file menu. The mode and the recent files are remembered
 - Narrow windows hide the document panel first, then the sidebar
 
 Reading
