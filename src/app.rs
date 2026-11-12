@@ -1,6 +1,7 @@
 //! The window: toolbar, page view, thumbnails, search and dialogs.
 
-use crate::edit::{self, Op};
+use crate::edit::{self, FormValue, Op};
+use crate::info::{DocInfo, Target, WidgetKind};
 use crate::print;
 use crate::register;
 use crate::render::{Job, Kind, OpenError, Out, Pool};
@@ -14,6 +15,7 @@ use eframe::egui::{
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use lopdf::ObjectId;
 use std::sync::mpsc::{Receiver, channel};
 
 /// Screen pixels per PDF point at 100% zoom.
@@ -44,6 +46,23 @@ enum Tool {
     Select,
     AddText,
     PlaceSig,
+    AddNote,
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum SideTab {
+    Pages,
+    Contents,
+}
+
+/// A sticky note being written.
+struct NoteDraft {
+    page: usize,
+    x: f32,
+    y: f32,
+    text: String,
+    focus: bool,
+    screen: Pos2,
 }
 
 struct PageTex {
@@ -166,6 +185,15 @@ enum Act {
     Extract(Vec<usize>),
     ToolAddText,
     AddText,
+    Highlight,
+    ToolNote,
+    AddNote,
+    DeleteAnnot(usize, ObjectId),
+    /// Go to a page and a height on it (points from its top), remembering where we were.
+    Goto(usize, f32),
+    Back,
+    OpenUrl(String),
+    CommitForm,
     ToolSign,
     SignGo,
     ShowSigs,
@@ -257,6 +285,28 @@ pub struct App {
     /// The user agreed to change a signed document.
     edit_signed_ok: bool,
     pending_edit: Option<(Op, Option<usize>, &'static str)>,
+    /// Links, contents, comments and form fields of the open document.
+    info: Option<Arc<DocInfo>>,
+    info_rx: Option<Receiver<(Arc<Vec<u8>>, Option<DocInfo>)>>,
+    side_tab: SideTab,
+    /// Form values typed in but not yet written into the document, by field.
+    form_edits: HashMap<ObjectId, FormValue>,
+    /// The text field being typed in (its widget id).
+    active_field: Option<ObjectId>,
+    focus_field: bool,
+    /// An open drop-down: widget, its place on screen, and the frame it opened in.
+    choice_open: Option<(ObjectId, Rect, u64)>,
+    /// What to do once the form values have been written into the document.
+    after_edit: Option<Act>,
+    queued: Vec<Act>,
+    note_draft: Option<NoteDraft>,
+    /// The comment whose text is shown: page, index on the page, screen position.
+    note_open: Option<(usize, usize, Pos2)>,
+    /// Places to return to after following links: page and height on it.
+    back: Vec<(usize, f32)>,
+    jump_offset: f32,
+    /// What the pointer is over (a link target), shown in the status bar.
+    hover: Option<String>,
 }
 
 impl App {
@@ -303,6 +353,20 @@ impl App {
             sign_draft: None,
             edit_signed_ok: false,
             pending_edit: None,
+            info: None,
+            info_rx: None,
+            side_tab: SideTab::Pages,
+            form_edits: HashMap::new(),
+            active_field: None,
+            focus_field: false,
+            choice_open: None,
+            after_edit: None,
+            queued: Vec::new(),
+            note_draft: None,
+            note_open: None,
+            back: Vec::new(),
+            jump_offset: 0.0,
+            hover: None,
         };
         // Switches used when taking automated screenshots.
         let args: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
@@ -360,10 +424,59 @@ impl App {
                 self.edit_signed_ok = false;
                 self.pending_edit = None;
                 self.show_sigs = false;
+                self.back.clear();
                 self.check_signatures(ctx);
+                self.read_info(ctx);
             }
             Err(e) => self.error = Some(format!("Cannot open {}\n{e}", path.display())),
         }
+    }
+
+    /// Read links, contents, comments and form fields of the current bytes, off the UI thread.
+    fn read_info(&mut self, ctx: &egui::Context) {
+        self.info = None;
+        self.info_rx = None;
+        self.form_edits.clear();
+        self.active_field = None;
+        self.choice_open = None;
+        self.note_open = None;
+        self.note_draft = None;
+        let Some(doc) = &self.doc else { return };
+        let (bytes, password) = (doc.bytes.clone(), doc.password.clone());
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let info = std::panic::catch_unwind(|| crate::info::extract(&bytes, &password)).unwrap_or(None);
+            let _ = tx.send((bytes, info));
+            ctx.request_repaint();
+        });
+        self.info_rx = Some(rx);
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.doc.as_ref().is_some_and(|d| d.dirty()) || !self.form_edits.is_empty()
+    }
+
+    /// Write the typed form values into the document, then carry on with `then`.
+    fn commit_form(&mut self, ctx: &egui::Context, then: Option<Act>) {
+        if self.form_edits.is_empty() || self.busy() || !self.doc.as_ref().is_some_and(|d| d.loaded) {
+            return;
+        }
+        let values = self.form_edits.iter().map(|(k, v)| (*k, v.clone())).collect();
+        self.after_edit = then;
+        self.active_field = None;
+        self.run_edit(ctx, Op::FillForm { values }, None, "Form filled in");
+    }
+
+    /// Where the view is now: page and height on it in points.
+    fn position(&self) -> Option<(usize, f32)> {
+        let doc = self.doc.as_ref()?;
+        if doc.sizes.is_empty() {
+            return None;
+        }
+        let lay = layout(&doc.sizes, self.zoom);
+        let page = lay.page_at(self.scroll.y);
+        Some((page, ((self.scroll.y - lay.tops[page]) / lay.ppt).max(0.0)))
     }
 
     /// Look for digital signatures in the current bytes and check them, off the UI thread.
@@ -405,6 +518,7 @@ impl App {
         self.sign_draft = None;
         self.reset_search();
         self.check_signatures(ctx);
+        self.read_info(ctx);
         match jump {
             Some(p) => self.jump = Some(p),
             None => self.set_scroll = Some(self.scroll),
@@ -483,6 +597,15 @@ impl App {
             None => {}
         }
 
+        if let Some(rx) = &self.info_rx {
+            if let Ok((bytes, info)) = rx.try_recv() {
+                self.info_rx = None;
+                if self.doc.as_ref().is_some_and(|d| Arc::ptr_eq(&d.bytes, &bytes)) {
+                    self.info = info.map(Arc::new);
+                }
+            }
+        }
+
         if let Some(rx) = &self.sig_rx {
             if let Ok((bytes, sigs)) = rx.try_recv() {
                 self.sig_rx = None;
@@ -523,10 +646,14 @@ impl App {
                         }
                         self.replace(ctx, (Arc::new(bytes), String::new()), jump);
                         self.status = label.to_string();
+                        if let Some(next) = self.after_edit.take() {
+                            self.queued.push(next);
+                        }
                     }
                     EditDone::Replace(Err(e), _, _) => {
                         self.status.clear();
                         self.error = Some(e);
+                        self.after_edit = None;
                     }
                     EditDone::Export(Ok(()), path) => self.status = format!("Saved {}", path.display()),
                     EditDone::Export(Err(e), _) => {
@@ -748,6 +875,29 @@ impl App {
     fn act(&mut self, ctx: &egui::Context, act: Act) {
         let n = self.doc.as_ref().map_or(0, |d| d.sizes.len());
         let cur = self.cur_page.min(n.saturating_sub(1));
+        // Anything that saves, prints or changes the document first takes in what was typed into the form.
+        let uses_document = matches!(
+            act,
+            Act::Save
+                | Act::SaveAs
+                | Act::Print
+                | Act::Undo
+                | Act::Rotate(..)
+                | Act::Delete
+                | Act::MovePage(_)
+                | Act::InsertPdf(_)
+                | Act::Extract(_)
+                | Act::AddText
+                | Act::Highlight
+                | Act::AddNote
+                | Act::DeleteAnnot(..)
+                | Act::SignGo
+                | Act::CloseAnswer(0)
+        );
+        if uses_document && !self.form_edits.is_empty() {
+            self.commit_form(ctx, Some(act));
+            return;
+        }
         match act {
             Act::Open => {
                 let mut dlg = rfd::FileDialog::new().add_filter("PDF", &["pdf"]);
@@ -980,6 +1130,63 @@ impl App {
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
             }
+            Act::CommitForm => self.commit_form(ctx, None),
+            Act::Highlight => {
+                let Some(sel) = self.sel.as_ref() else {
+                    self.status = "Select the text to highlight first".into();
+                    return;
+                };
+                let Some(text) = self.doc.as_ref().and_then(|d| d.texts.get(&sel.page)) else { return };
+                let (a, b) = (sel.anchor.min(sel.head), sel.anchor.max(sel.head));
+                let rects = text.rects(a, text.glyph_end(b));
+                let page = sel.page;
+                self.sel = None;
+                self.run_edit(ctx, Op::Highlight { page, rects, color: [1.0, 0.92, 0.23] }, None, "Highlighted");
+            }
+            Act::ToolNote => {
+                self.tool = if self.tool == Tool::AddNote { Tool::Select } else { Tool::AddNote };
+                self.note_draft = None;
+                self.draft = None;
+                self.sign_draft = None;
+                if self.tool == Tool::AddNote {
+                    self.status = "Click on the page where the note should go".into();
+                }
+            }
+            Act::AddNote => {
+                if let Some(d) = self.note_draft.take() {
+                    self.tool = Tool::Select;
+                    if !d.text.trim().is_empty() {
+                        self.run_edit(ctx, Op::AddNote { page: d.page, x: d.x, y: d.y, text: d.text }, None, "Note added");
+                    }
+                }
+            }
+            Act::DeleteAnnot(page, id) => {
+                self.note_open = None;
+                self.run_edit(ctx, Op::DeleteAnnot { page, id }, None, "Removed");
+            }
+            Act::Goto(page, y) => {
+                if n > 0 {
+                    if let Some(here) = self.position() {
+                        self.back.push(here);
+                        if self.back.len() > 50 {
+                            self.back.remove(0);
+                        }
+                    }
+                    self.jump = Some(page.min(n - 1));
+                    self.jump_offset = y;
+                }
+            }
+            Act::Back => {
+                if let Some((page, y)) = self.back.pop() {
+                    self.jump = Some(page);
+                    self.jump_offset = y;
+                }
+            }
+            Act::OpenUrl(url) => {
+                if !register::open_url(&url) {
+                    self.status = format!("This link was not opened: {url}");
+                }
+            }
             Act::ToolSign => {
                 self.tool = if self.tool == Tool::PlaceSig { Tool::Select } else { Tool::PlaceSig };
                 self.sign_draft = None;
@@ -1033,6 +1240,8 @@ impl App {
                     if yes {
                         self.edit_signed_ok = true;
                         self.run_edit(ctx, op, jump, label);
+                    } else {
+                        self.after_edit = None;
                     }
                 }
             }
@@ -1048,7 +1257,7 @@ impl App {
         let ctrl_shift = Modifiers::COMMAND | Modifiers::SHIFT;
 
         if ctx.input(|i| i.viewport().close_requested()) && !self.force_close {
-            if self.doc.as_ref().is_some_and(|d| d.dirty()) {
+            if self.is_dirty() {
                 ctx.send_viewport_cmd(ViewportCommand::CancelClose);
                 self.confirm_close = true;
             }
@@ -1100,9 +1309,14 @@ impl App {
             acts.push(Act::FindNext(false));
         }
         if hit(Modifiers::NONE, Key::Escape) {
-            if self.draft.is_some() || self.sign_draft.is_some() || self.tool != Tool::Select {
+            if self.choice_open.is_some() || self.note_open.is_some() || self.active_field.is_some() {
+                self.choice_open = None;
+                self.note_open = None;
+                self.active_field = None;
+            } else if self.draft.is_some() || self.sign_draft.is_some() || self.note_draft.is_some() || self.tool != Tool::Select {
                 self.draft = None;
                 self.sign_draft = None;
+                self.note_draft = None;
                 self.tool = Tool::Select;
             } else if self.search.open {
                 self.search.open = false;
@@ -1115,8 +1329,14 @@ impl App {
             acts.push(Act::Zoom(self.zoom * zoom));
         }
 
-        if typing || self.draft.is_some() || self.sign_draft.is_some() {
+        if hit(Modifiers::ALT, Key::ArrowLeft) {
+            acts.push(Act::Back);
+        }
+        if typing || self.draft.is_some() || self.sign_draft.is_some() || self.note_draft.is_some() {
             return;
+        }
+        if hit(ctrl, Key::H) {
+            acts.push(Act::Highlight);
         }
         if ctx.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) {
             acts.push(Act::Copy);
@@ -1163,7 +1383,7 @@ impl App {
     fn top_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         let has = self.doc.as_ref().is_some_and(|d| d.loaded);
         let n = self.doc.as_ref().map_or(0, |d| d.sizes.len());
-        let dirty = self.doc.as_ref().is_some_and(|d| d.dirty());
+        let dirty = self.is_dirty();
         let can_undo = self.doc.as_ref().is_some_and(|d| !d.undo.is_empty());
         let can_redo = self.doc.as_ref().is_some_and(|d| !d.redo.is_empty());
         let edit_ok = has && !self.busy();
@@ -1227,6 +1447,12 @@ impl App {
                     if item(ui, edit_ok, "Add text...", "") {
                         acts.push(Act::ToolAddText);
                     }
+                    if item(ui, edit_ok && self.sel.is_some(), "Highlight the selected text", "Ctrl+H") {
+                        acts.push(Act::Highlight);
+                    }
+                    if item(ui, edit_ok, "Add a note...", "") {
+                        acts.push(Act::ToolNote);
+                    }
                 });
                 ui.menu_button("Page", |ui| {
                     if item(ui, edit_ok, "Rotate right", "Ctrl+R") {
@@ -1289,8 +1515,11 @@ impl App {
                         acts.push(Act::Fit(Fit::Page));
                     }
                     ui.separator();
-                    if item(ui, true, if self.show_thumbs { "Hide page list" } else { "Show page list" }, "") {
+                    if item(ui, true, if self.show_thumbs { "Hide the side panel" } else { "Show pages and contents" }, "") {
                         acts.push(Act::ToggleThumbs);
+                    }
+                    if item(ui, !self.back.is_empty(), "Back to where the link was", "Alt+Left") {
+                        acts.push(Act::Back);
                     }
                 });
             });
@@ -1298,7 +1527,7 @@ impl App {
 
         egui::Panel::top("tools").show(ui, |ui| {
             ui.add_space(3.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
                 if ui.button("Open").on_hover_text("Open a PDF (Ctrl+O)").clicked() {
                     acts.push(Act::Open);
@@ -1374,6 +1603,21 @@ impl App {
                 }
                 if ui.add_enabled(can_undo && edit_ok, egui::Button::new("Undo")).on_hover_text("Undo (Ctrl+Z)").clicked() {
                     acts.push(Act::Undo);
+                }
+                if ui
+                    .add_enabled(edit_ok && self.sel.is_some(), egui::Button::new("Highlight"))
+                    .on_hover_text("Highlight the selected text (Ctrl+H)")
+                    .on_disabled_hover_text("Select text with the mouse first, then press Highlight")
+                    .clicked()
+                {
+                    acts.push(Act::Highlight);
+                }
+                if ui
+                    .add_enabled(edit_ok, egui::Button::selectable(self.tool == Tool::AddNote, "Note"))
+                    .on_hover_text("Stick a note on the page")
+                    .clicked()
+                {
+                    acts.push(Act::ToolNote);
                 }
                 if ui
                     .add_enabled(has && !self.busy(), egui::Button::selectable(self.tool == Tool::PlaceSig, "Sign"))
@@ -1456,19 +1700,20 @@ impl App {
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let dirty = self.is_dirty();
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 if self.busy() || self.print_rx.is_some() {
                     ui.spinner();
                 }
-                ui.label(&self.status);
+                ui.add(egui::Label::new(self.hover.as_deref().unwrap_or(&self.status)).truncate());
                 ui.with_layout(UiLayout::right_to_left(Align::Center), |ui| {
                     if let Some(doc) = &self.doc {
                         if let Some((w, h)) = doc.sizes.get(self.cur_page) {
                             ui.label(format!("{:.0} x {:.0} mm", w * 25.4 / 72.0, h * 25.4 / 72.0));
                             ui.separator();
                         }
-                        if doc.dirty() {
+                        if dirty {
                             ui.label("Not saved");
                         }
                     }
@@ -1478,6 +1723,7 @@ impl App {
     }
 
     fn thumbs_panel(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        let here = self.position().unwrap_or((self.cur_page, 0.0));
         let Some(doc) = self.doc.as_mut() else { return };
         let cur = self.cur_page;
         let jobs = &mut self.jobs_thumb;
@@ -1494,7 +1740,38 @@ impl App {
             }
         }
 
-        egui::Panel::left("thumbs").resizable(false).exact_size(THUMB_PANEL).show(ui, |ui| {
+        let info = self.info.clone();
+        let has_outline = info.as_ref().is_some_and(|i| !i.outline.is_empty());
+        let tab = if has_outline { self.side_tab } else { SideTab::Pages };
+        let width = if tab == SideTab::Contents { 270.0 } else { THUMB_PANEL };
+        egui::Panel::left("thumbs").resizable(false).exact_size(width).show(ui, |ui| {
+            if has_outline {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.side_tab, SideTab::Pages, "Pages");
+                    ui.selectable_value(&mut self.side_tab, SideTab::Contents, "Contents");
+                });
+                ui.separator();
+            }
+            if tab == SideTab::Contents {
+                let Some(info) = &info else { return };
+                // The entry being read: the last one that starts at or above the top of the view.
+                let current = info.outline.iter().rposition(|o| o.page.is_some_and(|p| p < here.0 || (p == here.0 && o.y <= here.1 + 60.0)));
+                ScrollArea::vertical().auto_shrink(false).id_salt("outline").show(ui, |ui| {
+                    for (k, item) in info.outline.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.add_space(item.level.min(8) as f32 * 12.0);
+                            let entry = egui::Button::selectable(current == Some(k), item.title.as_str()).truncate();
+                            if ui.add_enabled(item.page.is_some(), entry).clicked() {
+                                if let Some(page) = item.page {
+                                    acts.push(Act::Goto(page, item.y));
+                                }
+                            }
+                        });
+                    }
+                });
+                return;
+            }
             let mut area = ScrollArea::vertical().auto_shrink(false).id_salt("thumbs");
             if let Some(y) = self.thumb_scroll.take() {
                 area = area.vertical_scroll_offset(y);
@@ -1601,7 +1878,8 @@ impl App {
             if loaded {
                 if let Some(p) = self.jump.take() {
                     let p = p.min(n - 1);
-                    self.set_scroll = Some(vec2(self.scroll.x, (lay.tops[p] - GAP * 0.5).max(0.0)));
+                    let offset = std::mem::take(&mut self.jump_offset) * lay.ppt;
+                    self.set_scroll = Some(vec2(self.scroll.x, (lay.tops[p] + offset - GAP * 0.5).max(0.0)));
                 }
             }
             let mut area = ScrollArea::both().auto_shrink(false).id_salt("pages");
@@ -1613,6 +1891,15 @@ impl App {
             let sel = &mut self.sel;
             let draft = &mut self.draft;
             let sign_draft = &mut self.sign_draft;
+            let note_draft = &mut self.note_draft;
+            let note_open = &mut self.note_open;
+            let info = self.info.clone();
+            let form_edits = &mut self.form_edits;
+            let active_field = &mut self.active_field;
+            let focus_field = &mut self.focus_field;
+            let choice_open = &mut self.choice_open;
+            self.hover = None;
+            let hover = &mut self.hover;
             let search = &self.search;
             let jobs = &mut self.jobs_view;
             let mut cur_page = self.cur_page;
@@ -1621,7 +1908,7 @@ impl App {
             let out = area.show_viewport(ui, |ui, viewport| {
                 let total = vec2(lay.w.max(viewport.width()), lay.h.max(viewport.height()));
                 let (rect, resp) = ui.allocate_exact_size(total, Sense::click_and_drag());
-                let painter = ui.painter();
+                let painter = ui.painter().clone();
                 let page_rect = |i: usize| {
                     let (w, h) = (doc.sizes[i].0 * lay.ppt, doc.sizes[i].1 * lay.ppt);
                     let min = pos2(snap(rect.left() + (total.x - w) * 0.5), snap(rect.top() + lay.tops[i]));
@@ -1711,6 +1998,201 @@ impl App {
                         }
                     }
 
+                    if let Some(d) = note_draft.as_ref().filter(|d| d.page == i) {
+                        let at = Rect::from_min_size(r.min + vec2(d.x, d.y) * lay.ppt, vec2(18.0, 18.0) * lay.ppt);
+                        painter.rect_filled(at, 2.0, Color32::from_rgb(255, 212, 41));
+                        painter.rect_stroke(at, 2.0, Stroke::new(1.0, Color32::from_rgb(128, 92, 0)), StrokeKind::Inside);
+                    }
+
+                    // Links, comments and form fields lie on top of the page picture.
+                    if let Some(inf) = info.as_deref().filter(|_| tool == Tool::Select) {
+                        if let Some(pi) = inf.pages.get(i) {
+                            let on_screen = |q: [f32; 4]| Rect::from_min_max(r.min + vec2(q[0], q[1]) * lay.ppt, r.min + vec2(q[2], q[3]) * lay.ppt);
+                            let base = ui.scope_id().with(("page", i));
+                            for (k, link) in pi.links.iter().enumerate() {
+                                let lr = ui.interact(on_screen(link.rect), base.with(("link", k)), Sense::click());
+                                if lr.hovered() {
+                                    ctx.set_cursor_icon(CursorIcon::PointingHand);
+                                    *hover = Some(match &link.target {
+                                        Target::Url(url) => url.clone(),
+                                        Target::Page(p, _) => format!("Go to page {}", p + 1),
+                                    });
+                                }
+                                if lr.clicked() {
+                                    acts.push(match &link.target {
+                                        Target::Url(url) => Act::OpenUrl(url.clone()),
+                                        Target::Page(p, y) => Act::Goto(*p, *y),
+                                    });
+                                }
+                            }
+                            for (k, note) in pi.notes.iter().enumerate() {
+                                let mut nr = ui.interact(on_screen(note.rect), base.with(("note", k)), Sense::click());
+                                if nr.hovered() && !note.highlight {
+                                    ctx.set_cursor_icon(CursorIcon::PointingHand);
+                                }
+                                if !note.text.is_empty() {
+                                    nr = nr.on_hover_text(note.text.as_str());
+                                }
+                                if nr.clicked() {
+                                    *note_open = Some((i, k, nr.rect.right_top() + vec2(8.0, 0.0)));
+                                }
+                            }
+
+                            let tint = Color32::from_rgba_unmultiplied(60, 120, 255, 34);
+                            let paper = Color32::from_rgb(233, 240, 255);
+                            let ink = Color32::BLACK;
+                            for w in &pi.widgets {
+                                let wr = on_screen(w.rect);
+                                let wid = base.with(("field", w.id));
+                                let edited = form_edits.get(&w.field).cloned();
+                                match &w.kind {
+                                    WidgetKind::Text { value, multiline, max_len, size } => {
+                                        let cur = match &edited {
+                                            Some(FormValue::Text(t)) => t.clone(),
+                                            _ => value.clone(),
+                                        };
+                                        let pts = if *size > 0.0 {
+                                            *size
+                                        } else if *multiline {
+                                            10.0
+                                        } else {
+                                            ((w.rect[3] - w.rect[1]) * 0.65).clamp(4.0, 12.0)
+                                        };
+                                        let font = FontId::proportional((pts * lay.ppt).max(4.0));
+                                        if *active_field == Some(w.id) {
+                                            painter.rect_filled(wr, 0.0, paper);
+                                            let mut text = cur.clone();
+                                            let mut edit = if *multiline { egui::TextEdit::multiline(&mut text) } else { egui::TextEdit::singleline(&mut text) };
+                                            edit = edit
+                                                .id(wid)
+                                                .frame(egui::Frame::NONE)
+                                                .font(font)
+                                                .text_color(ink)
+                                                .margin(egui::Margin::symmetric(2, 0))
+                                                .desired_width(wr.width());
+                                            if let Some(limit) = max_len {
+                                                edit = edit.char_limit(*limit);
+                                            }
+                                            let tr = ui.put(wr, edit);
+                                            if std::mem::take(focus_field) {
+                                                tr.request_focus();
+                                            }
+                                            if text != cur {
+                                                if text == *value {
+                                                    form_edits.remove(&w.field);
+                                                } else {
+                                                    form_edits.insert(w.field, FormValue::Text(text));
+                                                }
+                                            }
+                                            if tr.lost_focus() {
+                                                // Tab moves on to the next text field.
+                                                let tab = ui.input(|i| i.key_pressed(Key::Tab) && !i.modifiers.shift);
+                                                *active_field = if tab { inf.next_text_widget(w.id) } else { None };
+                                                *focus_field = active_field.is_some();
+                                            }
+                                        } else {
+                                            let hit = ui.interact(wr, wid.with("hit"), Sense::click());
+                                            if edited.is_some() {
+                                                painter.rect_filled(wr, 0.0, paper);
+                                                let clipped = painter.with_clip_rect(wr);
+                                                if *multiline {
+                                                    clipped.text(wr.min + vec2(2.0, 1.0), Align2::LEFT_TOP, &cur, font, ink);
+                                                } else {
+                                                    clipped.text(pos2(wr.left() + 2.0, wr.center().y), Align2::LEFT_CENTER, &cur, font, ink);
+                                                }
+                                            } else {
+                                                painter.rect_filled(wr, 0.0, tint);
+                                            }
+                                            if hit.hovered() {
+                                                ctx.set_cursor_icon(CursorIcon::Text);
+                                                *hover = Some(format!("Form field: {}", w.name));
+                                            }
+                                            if hit.clicked() {
+                                                *active_field = Some(w.id);
+                                                *focus_field = true;
+                                            }
+                                        }
+                                    }
+                                    WidgetKind::Check { on, checked } => {
+                                        let state = match &edited {
+                                            Some(FormValue::State(s)) => s == on,
+                                            _ => *checked,
+                                        };
+                                        let hit = ui.interact(wr, wid, Sense::click());
+                                        if edited.is_some() {
+                                            painter.rect_filled(wr, 0.0, paper);
+                                            painter.rect_stroke(wr, 0.0, Stroke::new(1.0, Color32::from_gray(80)), StrokeKind::Inside);
+                                            if state {
+                                                let b = wr.shrink(wr.width() * 0.22);
+                                                let pen = Stroke::new((wr.width() * 0.13).max(1.5), ink);
+                                                let knee = pos2(b.left() + b.width() * 0.36, b.bottom());
+                                                painter.line_segment([pos2(b.left(), b.center().y), knee], pen);
+                                                painter.line_segment([knee, b.right_top()], pen);
+                                            }
+                                        } else {
+                                            painter.rect_filled(wr, 0.0, tint);
+                                        }
+                                        if hit.hovered() {
+                                            ctx.set_cursor_icon(CursorIcon::PointingHand);
+                                        }
+                                        if hit.clicked() {
+                                            if !state == *checked {
+                                                form_edits.remove(&w.field);
+                                            } else {
+                                                let next = if state { "Off".to_string() } else { on.clone() };
+                                                form_edits.insert(w.field, FormValue::State(next));
+                                            }
+                                        }
+                                    }
+                                    WidgetKind::Radio { on, checked } => {
+                                        let chosen = match &edited {
+                                            Some(FormValue::State(s)) => s == on,
+                                            _ => *checked,
+                                        };
+                                        let hit = ui.interact(wr, wid, Sense::click());
+                                        let radius = wr.width().min(wr.height()) * 0.5;
+                                        if edited.is_some() {
+                                            painter.circle_filled(wr.center(), radius, paper);
+                                            painter.circle_stroke(wr.center(), radius - 0.5, Stroke::new(1.0, Color32::from_gray(80)));
+                                            if chosen {
+                                                painter.circle_filled(wr.center(), radius * 0.45, ink);
+                                            }
+                                        } else {
+                                            painter.circle_filled(wr.center(), radius, tint);
+                                        }
+                                        if hit.hovered() {
+                                            ctx.set_cursor_icon(CursorIcon::PointingHand);
+                                        }
+                                        if hit.clicked() && !chosen {
+                                            form_edits.insert(w.field, FormValue::State(on.clone()));
+                                        }
+                                    }
+                                    WidgetKind::Choice { value, options } => {
+                                        let cur = match &edited {
+                                            Some(FormValue::Text(t)) => t.clone(),
+                                            _ => value.clone(),
+                                        };
+                                        let hit = ui.interact(wr, wid, Sense::click());
+                                        if edited.is_some() {
+                                            let shown = options.iter().find(|(stored, _)| *stored == cur).map_or(cur.as_str(), |(_, label)| label.as_str());
+                                            painter.rect_filled(wr, 0.0, paper);
+                                            let font = FontId::proportional((((w.rect[3] - w.rect[1]) * 0.6).clamp(4.0, 12.0) * lay.ppt).max(4.0));
+                                            painter.with_clip_rect(wr).text(pos2(wr.left() + 2.0, wr.center().y), Align2::LEFT_CENTER, shown, font, ink);
+                                        } else {
+                                            painter.rect_filled(wr, 0.0, tint);
+                                        }
+                                        if hit.hovered() {
+                                            ctx.set_cursor_icon(CursorIcon::PointingHand);
+                                        }
+                                        if hit.clicked() {
+                                            *choice_open = Some((w.id, wr, frame_no));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Where the new signature will sit.
                     if let Some(d) = sign_draft.as_ref().filter(|d| d.page == i && d.visible) {
                         let box_rect = Rect::from_min_size(r.min + vec2(d.x, d.y) * lay.ppt, vec2(SIG_W, SIG_H) * lay.ppt);
@@ -1736,6 +2218,19 @@ impl App {
                 let locate = |pos: Pos2| visible.iter().copied().find(|&i| page_rect(i).contains(pos));
                 let in_page = |i: usize, pos: Pos2| (pos - page_rect(i).min) / lay.ppt;
                 match tool {
+                    Tool::AddNote => {
+                        if resp.hovered() {
+                            ctx.set_cursor_icon(CursorIcon::Crosshair);
+                        }
+                        if resp.clicked() {
+                            if let Some(pos) = resp.interact_pointer_pos() {
+                                if let Some(i) = locate(pos) {
+                                    let p = in_page(i, pos);
+                                    *note_draft = Some(NoteDraft { page: i, x: p.x, y: p.y, text: String::new(), focus: true, screen: pos });
+                                }
+                            }
+                        }
+                    }
                     Tool::PlaceSig => {
                         if resp.hovered() {
                             ctx.set_cursor_icon(CursorIcon::Crosshair);
@@ -1836,6 +2331,44 @@ impl App {
             });
             self.scroll = out.state.clamped_offset();
             self.cur_page = cur_page;
+
+            // The list of an open drop-down field.
+            if let Some((wid, at, opened)) = self.choice_open {
+                let widget = self.info.as_ref().and_then(|inf| inf.widget(wid).map(|w| (w.field, &w.kind)));
+                let mut close = widget.is_none();
+                if let Some((field, WidgetKind::Choice { value, options })) = widget {
+                    let cur = match self.form_edits.get(&field) {
+                        Some(FormValue::Text(t)) => t.clone(),
+                        _ => value.clone(),
+                    };
+                    let mut picked = None;
+                    let area = egui::Area::new(egui::Id::unique("choice_list")).order(egui::Order::Foreground).fixed_pos(at.left_bottom()).show(&ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.set_min_width(at.width().max(120.0));
+                            ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                                for (stored, label) in options {
+                                    if ui.selectable_label(*stored == cur, label.as_str()).clicked() {
+                                        picked = Some(stored.clone());
+                                    }
+                                }
+                            });
+                        });
+                    });
+                    if let Some(stored) = picked {
+                        if stored == *value {
+                            self.form_edits.remove(&field);
+                        } else {
+                            self.form_edits.insert(field, FormValue::Text(stored));
+                        }
+                        close = true;
+                    } else if self.frame > opened && ctx.input(|i| i.pointer.any_click()) && !area.response.contains_pointer() {
+                        close = true;
+                    }
+                }
+                if close {
+                    self.choice_open = None;
+                }
+            }
         });
     }
 
@@ -1930,6 +2463,61 @@ impl App {
             });
             if close {
                 self.extract = None;
+            }
+        }
+
+        if let Some(d) = self.note_draft.as_mut() {
+            let mut open = true;
+            let mut done = false;
+            egui::Window::new("Add a note").collapsible(false).resizable(false).open(&mut open).default_pos(d.screen + vec2(24.0, 40.0)).show(ctx, |ui| {
+                let r = ui.add(egui::TextEdit::multiline(&mut d.text).desired_rows(4).desired_width(280.0));
+                if std::mem::take(&mut d.focus) {
+                    r.request_focus();
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(!d.text.trim().is_empty(), egui::Button::new("Add note")).clicked() {
+                        done = true;
+                    }
+                    ui.label("Ctrl+Enter");
+                });
+                if ui.input(|i| i.modifiers.command && i.key_pressed(Key::Enter)) && !d.text.trim().is_empty() {
+                    done = true;
+                }
+            });
+            if done {
+                acts.push(Act::AddNote);
+            } else if !open {
+                self.note_draft = None;
+                self.tool = Tool::Select;
+            }
+        }
+
+        if let Some((page, k, at)) = self.note_open {
+            let note = self.info.as_ref().and_then(|inf| inf.pages.get(page)).and_then(|p| p.notes.get(k));
+            match note {
+                Some(note) => {
+                    let mut open = true;
+                    let title = if note.highlight { "Highlight" } else { "Note" };
+                    egui::Window::new(title).id(egui::Id::unique("note_shown")).collapsible(false).resizable(false).open(&mut open).fixed_pos(at).show(ctx, |ui| {
+                        ui.set_max_width(300.0);
+                        if !note.author.is_empty() {
+                            ui.label(egui::RichText::new(&note.author).strong());
+                        }
+                        if !note.text.is_empty() {
+                            ui.label(&note.text);
+                            ui.add_space(4.0);
+                        }
+                        let label = if note.highlight { "Remove highlight" } else { "Delete note" };
+                        if ui.add_enabled(self.edit_rx.is_none(), egui::Button::new(label)).clicked() {
+                            acts.push(Act::DeleteAnnot(page, note.id));
+                        }
+                    });
+                    if !open {
+                        self.note_open = None;
+                    }
+                }
+                None => self.note_open = None,
             }
         }
 
@@ -2082,7 +2670,7 @@ impl App {
 
     fn update_title(&mut self, ctx: &egui::Context) {
         let title = match &self.doc {
-            Some(d) => format!("{}{} - ProtoPDF", d.name(), if d.dirty() { " *" } else { "" }),
+            Some(d) => format!("{}{} - ProtoPDF", d.name(), if d.dirty() || !self.form_edits.is_empty() { " *" } else { "" }),
             None => "ProtoPDF".to_string(),
         };
         if title != self.title {
@@ -2098,7 +2686,7 @@ impl App {
         }
         ctx.request_repaint();
         let settled = match &self.doc {
-            Some(d) => d.loaded && !d.pool.busy() && !self.busy() && self.sig_rx.is_none(),
+            Some(d) => d.loaded && !d.pool.busy() && !self.busy() && self.sig_rx.is_none() && self.info_rx.is_none() && self.queued.is_empty(),
             None => true,
         };
         self.shot_wait = if settled { self.shot_wait + 1 } else { 0 };
@@ -2147,6 +2735,71 @@ impl App {
                 return;
             }
             "showsigs" => Act::ShowSigs,
+            "highlight" => Act::Highlight,
+            "commit" => Act::CommitForm,
+            "save" => Act::Save,
+            "back" => Act::Back,
+            "contents" => {
+                self.show_thumbs = true;
+                self.side_tab = SideTab::Contents;
+                return;
+            }
+            // goto:<n> follows the n-th entry of the contents; link:<n> the n-th link on this page.
+            "goto" | "link" => {
+                let Some(info) = self.info.clone() else { return };
+                let k = arg.parse::<usize>().unwrap_or(1).saturating_sub(1);
+                let target = if name == "goto" {
+                    info.outline.get(k).and_then(|o| o.page.map(|p| (p, o.y)))
+                } else {
+                    match info.pages.get(self.cur_page).and_then(|p| p.links.get(k)).map(|l| &l.target) {
+                        Some(Target::Page(p, y)) => Some((*p, *y)),
+                        Some(Target::Url(u)) => {
+                            self.status = format!("link to {u}");
+                            None
+                        }
+                        None => None,
+                    }
+                };
+                match target {
+                    Some((page, y)) => Act::Goto(page, y),
+                    None => return,
+                }
+            }
+            // fill:<field name>=<value>. Checkboxes take on/off, radio buttons and lists the stored value.
+            "fill" | "type" => {
+                let Some(info) = self.info.clone() else { return };
+                let (field, value) = arg.split_once('=').unwrap_or((arg, ""));
+                for w in info.pages.iter().flat_map(|p| p.widgets.iter()).filter(|w| w.name == field) {
+                    match &w.kind {
+                        WidgetKind::Text { .. } | WidgetKind::Choice { .. } => {
+                            self.form_edits.insert(w.field, FormValue::Text(value.replace("\\n", "\n")));
+                            if name == "type" {
+                                self.active_field = Some(w.id);
+                                self.focus_field = true;
+                            }
+                        }
+                        WidgetKind::Check { on, .. } => {
+                            let state = if value == "on" { on.clone() } else { "Off".to_string() };
+                            self.form_edits.insert(w.field, FormValue::State(state));
+                        }
+                        WidgetKind::Radio { .. } => {
+                            self.form_edits.insert(w.field, FormValue::State(value.to_string()));
+                        }
+                    }
+                }
+                return;
+            }
+            "note" => {
+                let mut it = arg.splitn(3, ',');
+                let x = it.next().and_then(|v| v.parse().ok()).unwrap_or(40.0);
+                let y = it.next().and_then(|v| v.parse().ok()).unwrap_or(40.0);
+                self.note_draft = Some(NoteDraft { page: self.cur_page, x, y, text: it.next().unwrap_or("").to_string(), focus: false, screen: pos2(300.0, 300.0) });
+                Act::AddNote
+            }
+            "shownote" => {
+                self.note_open = Some((self.cur_page, arg.parse::<usize>().unwrap_or(1).saturating_sub(1), pos2(420.0, 220.0)));
+                return;
+            }
             "editsigned" => Act::EditSigned(true),
             "placesig" => {
                 let mut it = arg.split(',');
@@ -2242,6 +2895,10 @@ impl eframe::App for App {
         self.poll(&ctx);
 
         let mut acts = Vec::new();
+        // Steps that were waiting for the form values to be written into the document.
+        if !self.queued.is_empty() && !self.busy() && self.doc.as_ref().is_some_and(|d| d.loaded) {
+            acts.append(&mut self.queued);
+        }
         self.shortcuts(&ctx, &mut acts);
         self.top_bar(ui, &mut acts);
         self.status_bar(ui);

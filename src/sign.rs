@@ -314,7 +314,7 @@ fn string_after(dict: &[u8], key: &[u8]) -> String {
     String::new()
 }
 
-fn decode_text(raw: &[u8]) -> String {
+pub(crate) fn decode_text(raw: &[u8]) -> String {
     if raw.starts_with(&[0xFE, 0xFF]) {
         let units: Vec<u16> = raw[2..].chunks(2).map(|p| u16::from_be_bytes([p[0], p.get(1).copied().unwrap_or(0)])).collect();
         String::from_utf16_lossy(&units)

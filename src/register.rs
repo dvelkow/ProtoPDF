@@ -84,6 +84,18 @@ pub fn is_default() -> bool {
         .unwrap_or(false)
 }
 
+/// Open a web or mail link in the default browser or mail program.
+/// Anything else (files, programs, other schemes) is refused.
+pub fn open_url(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:")) {
+        return false;
+    }
+    let target = HSTRING::from(url.trim());
+    let result = unsafe { ShellExecuteW(None, w!("open"), &target, PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL) };
+    result.0 as usize > 32
+}
+
 /// Open the Windows "Default apps" page for this program.
 pub fn open_settings() {
     let url = HSTRING::from(format!("ms-settings:defaultapps?registeredAppUser={APP}"));

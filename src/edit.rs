@@ -18,13 +18,29 @@ pub enum Op {
     /// Write text on a page. `x`/`y` are the top-left corner of the first line
     /// in viewer coordinates (points from the top-left of the page as displayed).
     AddText { page: usize, x: f32, y: f32, text: String, size: f32, color: [f32; 3] },
+    /// Mark text with a highlighter. The rectangles are in viewer coordinates, one per line.
+    Highlight { page: usize, rects: Vec<[f32; 4]>, color: [f32; 3] },
+    /// Put a sticky note with its top-left corner at `x`/`y` (viewer coordinates).
+    AddNote { page: usize, x: f32, y: f32, text: String },
+    /// Remove a highlight or note.
+    DeleteAnnot { page: usize, id: ObjectId },
+    /// Set the values of form fields, given by the object id of each field.
+    FillForm { values: Vec<(ObjectId, FormValue)> },
+}
+
+#[derive(Clone)]
+pub enum FormValue {
+    /// Text of a text field, or the chosen value of a list.
+    Text(String),
+    /// The state of a checkbox ("Off" or its on-state) or the chosen radio button.
+    State(String),
 }
 
 fn err<E: std::fmt::Display>(what: &'static str) -> impl Fn(E) -> String {
     move |e| format!("{what}: {e}")
 }
 
-fn load(bytes: &[u8], password: &str) -> Res<Document> {
+pub(crate) fn load(bytes: &[u8], password: &str) -> Res<Document> {
     let mut doc = if password.is_empty() {
         Document::load_mem(bytes)
     } else {
@@ -131,6 +147,10 @@ pub fn apply(bytes: &[u8], password: &str, op: Op) -> Res<Vec<u8>> {
         Op::AddText { page, x, y, text, size, color } => {
             add_text(&mut doc, pages[check(page)?], x, y, &text, size, color)?;
         }
+        Op::Highlight { page, rects, color } => add_highlight(&mut doc, pages[check(page)?], &rects, color)?,
+        Op::AddNote { page, x, y, text } => add_note(&mut doc, pages[check(page)?], x, y, &text)?,
+        Op::DeleteAnnot { page, id } => remove_annot(&mut doc, pages[check(page)?], id)?,
+        Op::FillForm { values } => fill_form(&mut doc, values)?,
     }
     save(&mut doc)
 }
@@ -184,7 +204,7 @@ fn set_kids(doc: &mut Document, root: ObjectId, pages: &[ObjectId]) -> Res<()> {
     Ok(())
 }
 
-fn num(o: &Object) -> Option<f32> {
+pub(crate) fn num(o: &Object) -> Option<f32> {
     match o {
         Object::Integer(i) => Some(*i as f32),
         Object::Real(r) => Some(*r),
@@ -233,6 +253,383 @@ pub(crate) fn view_to_user(b: [f32; 4], rot: i64, vx: f32, vy: f32) -> ((f32, f3
         270 => ((x0 + w - vy, y0 + h - vx), [0.0, -1.0, 1.0, 0.0]),
         _ => ((x0 + vx, y0 + h - vy), [1.0, 0.0, 0.0, 1.0]),
     }
+}
+
+/// The reverse of `view_to_user`: where a point of the page lands in the viewer.
+pub(crate) fn user_to_view(b: [f32; 4], rot: i64, ux: f32, uy: f32) -> (f32, f32) {
+    let (x0, y0) = (b[0], b[1]);
+    let (w, h) = (b[2] - b[0], b[3] - b[1]);
+    match rot {
+        90 => (uy - y0, ux - x0),
+        180 => (x0 + w - ux, uy - y0),
+        270 => (y0 + h - uy, x0 + w - ux),
+        _ => (ux - x0, y0 + h - uy),
+    }
+}
+
+pub(crate) fn text_string(s: &str) -> Object {
+    if s.is_ascii() {
+        Object::string_literal(s)
+    } else {
+        let mut b = vec![0xFE, 0xFF];
+        b.extend(s.encode_utf16().flat_map(u16::to_be_bytes));
+        Object::String(b, lopdf::StringFormat::Hexadecimal)
+    }
+}
+
+fn pdf_date_now() -> String {
+    let now = chrono::Local::now();
+    let offset = now.offset().local_minus_utc();
+    format!("D:{}{}{:02}'{:02}'", now.format("%Y%m%d%H%M%S"), if offset < 0 { '-' } else { '+' }, offset.abs() / 3600, offset.abs() % 3600 / 60)
+}
+
+fn reals(values: &[f32]) -> Vec<Object> {
+    values.iter().map(|v| Object::Real(*v)).collect()
+}
+
+/// Add an annotation to a page, whether its list of annotations is stored in
+/// the page or in an object of its own.
+fn push_annot(doc: &mut Document, page: ObjectId, annot: ObjectId) -> Res<()> {
+    let item = Object::Reference(annot);
+    let existing = doc.get_dictionary(page).map_err(err("Page"))?.get(b"Annots").ok().cloned();
+    match existing {
+        Some(Object::Reference(list)) if matches!(doc.get_object(list), Ok(Object::Array(_))) => {
+            if let Ok(Object::Array(a)) = doc.get_object_mut(list) {
+                a.push(item);
+            }
+        }
+        Some(Object::Array(mut a)) => {
+            a.push(item);
+            doc.get_dictionary_mut(page).map_err(err("Page"))?.set("Annots", a);
+        }
+        _ => doc.get_dictionary_mut(page).map_err(err("Page"))?.set("Annots", vec![item]),
+    }
+    Ok(())
+}
+
+fn remove_annot(doc: &mut Document, page: ObjectId, id: ObjectId) -> Res<()> {
+    let popup = doc.get_dictionary(id).ok().and_then(|d| d.get(b"Popup").ok()).and_then(|p| p.as_reference().ok());
+    let gone = |o: &Object| matches!(o, Object::Reference(r) if *r == id || Some(*r) == popup);
+    let existing = doc.get_dictionary(page).map_err(err("Page"))?.get(b"Annots").ok().cloned();
+    match existing {
+        Some(Object::Reference(list)) => {
+            if let Ok(Object::Array(a)) = doc.get_object_mut(list) {
+                a.retain(|o| !gone(o));
+            }
+        }
+        Some(Object::Array(mut a)) => {
+            a.retain(|o| !gone(o));
+            doc.get_dictionary_mut(page).map_err(err("Page"))?.set("Annots", a);
+        }
+        _ => return Err("This comment is no longer on the page.".into()),
+    }
+    doc.objects.remove(&id);
+    if let Some(p) = popup {
+        doc.objects.remove(&p);
+    }
+    Ok(())
+}
+
+fn add_highlight(doc: &mut Document, page: ObjectId, rects: &[[f32; 4]], color: [f32; 3]) -> Res<()> {
+    if rects.is_empty() {
+        return Err("Select some text first.".into());
+    }
+    let (bbox, rot) = page_box(doc, page)?;
+    let mut quads = Vec::new();
+    let mut path = String::new();
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    for r in rects {
+        let corner = |vx: f32, vy: f32| view_to_user(bbox, rot, vx, vy).0;
+        let (tl, tr, bl, br) = (corner(r[0], r[1]), corner(r[2], r[1]), corner(r[0], r[3]), corner(r[2], r[3]));
+        for p in [tl, tr, bl, br] {
+            quads.extend([p.0, p.1]);
+            x0 = x0.min(p.0);
+            y0 = y0.min(p.1);
+            x1 = x1.max(p.0);
+            y1 = y1.max(p.1);
+        }
+        path.push_str(&format!("{:.2} {:.2} m {:.2} {:.2} l {:.2} {:.2} l {:.2} {:.2} l h\n", tl.0, tl.1, tr.0, tr.1, br.0, br.1, bl.0, bl.1));
+    }
+    // Multiply keeps the text underneath fully black, like a real marker.
+    let ops = format!("/GS0 gs\n{:.3} {:.3} {:.3} rg\n{path}f\n", color[0], color[1], color[2]);
+    let ap = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "FormType" => 1,
+            "BBox" => reals(&[x0, y0, x1, y1]),
+            "Resources" => dictionary! { "ExtGState" => dictionary! { "GS0" => dictionary! { "Type" => "ExtGState", "BM" => "Multiply" } } },
+        },
+        ops.into_bytes(),
+    ));
+    let annot = doc.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Highlight",
+        "Rect" => reals(&[x0, y0, x1, y1]),
+        "QuadPoints" => reals(&quads),
+        "C" => reals(&color),
+        "F" => 4,
+        "M" => Object::string_literal(pdf_date_now()),
+        "P" => page,
+        "AP" => dictionary! { "N" => ap },
+    });
+    push_annot(doc, page, annot)
+}
+
+fn add_note(doc: &mut Document, page: ObjectId, x: f32, y: f32, text: &str) -> Res<()> {
+    if text.trim().is_empty() {
+        return Err("The note is empty.".into());
+    }
+    const SIZE: f32 = 18.0;
+    let (bbox, rot) = page_box(doc, page)?;
+    let ((ax, ay), m) = view_to_user(bbox, rot, x, y);
+    let ((bx, by), _) = view_to_user(bbox, rot, x + SIZE, y + SIZE);
+    let ops = "q\n1 0.83 0.16 rg 0.5 0.36 0 RG 0.7 w\n1 3.5 16 13.5 re B\n0.9 w\n4 13 m 14 13 l S\n4 10.2 m 14 10.2 l S\n4 7.4 m 10 7.4 l S\nQ\n";
+    let ap = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "FormType" => 1,
+            "BBox" => reals(&[0.0, 0.0, SIZE, SIZE]),
+            "Matrix" => reals(&[m[0], m[1], m[2], m[3], 0.0, 0.0]),
+        },
+        ops.as_bytes().to_vec(),
+    ));
+    let annot = doc.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Text",
+        "Name" => "Comment",
+        "Rect" => reals(&[ax.min(bx), ay.min(by), ax.max(bx), ay.max(by)]),
+        "Contents" => text_string(text.trim()),
+        "C" => reals(&[1.0, 0.83, 0.16]),
+        "F" => 4,
+        "M" => Object::string_literal(pdf_date_now()),
+        "P" => page,
+        "AP" => dictionary! { "N" => ap },
+    });
+    push_annot(doc, page, annot)
+}
+
+/// A field attribute, taken from the field or inherited from its parents.
+fn field_attr(doc: &Document, id: ObjectId, key: &[u8]) -> Option<Object> {
+    let mut cur = id;
+    for _ in 0..32 {
+        let d = doc.get_dictionary(cur).ok()?;
+        if let Ok(v) = d.get(key) {
+            return Some(doc.dereference(v).map(|(_, o)| o.clone()).unwrap_or_else(|_| v.clone()));
+        }
+        cur = d.get(b"Parent").ok()?.as_reference().ok()?;
+    }
+    None
+}
+
+/// The widgets (boxes on pages) that show a field: the field itself, or its kids.
+fn field_widgets(doc: &Document, field: ObjectId, out: &mut Vec<ObjectId>, depth: usize) {
+    let Ok(d) = doc.get_dictionary(field) else { return };
+    if d.has(b"Rect") {
+        out.push(field);
+    }
+    if depth > 16 {
+        return;
+    }
+    if let Ok(Object::Array(kids)) = d.get(b"Kids").map(|k| doc.dereference(k).map(|(_, o)| o).unwrap_or(k)) {
+        for kid in kids {
+            if let Ok(id) = kid.as_reference() {
+                field_widgets(doc, id, out, depth + 1);
+            }
+        }
+    }
+}
+
+fn fill_form(doc: &mut Document, values: Vec<(ObjectId, FormValue)>) -> Res<()> {
+    for (field, value) in values {
+        let mut widgets = Vec::new();
+        field_widgets(doc, field, &mut widgets, 0);
+        match value {
+            FormValue::State(state) => {
+                doc.get_dictionary_mut(field).map_err(err("Form field"))?.set("V", Object::Name(state.clone().into_bytes()));
+                for w in widgets {
+                    let on = doc.get_dictionary(w).ok().and_then(|d| crate::info::on_state(doc, d));
+                    let shown = if on.as_deref() == Some(state.as_str()) { state.as_str() } else { "Off" };
+                    doc.get_dictionary_mut(w).map_err(err("Form field"))?.set("AS", Object::Name(shown.as_bytes().to_vec()));
+                }
+            }
+            FormValue::Text(text) => {
+                // A list stores one value and shows another.
+                let mut shown = text.clone();
+                if let Some(Object::Array(options)) = field_attr(doc, field, b"Opt") {
+                    for o in &options {
+                        if let Ok((_, Object::Array(pair))) = doc.dereference(o) {
+                            if let [Object::String(stored, _), Object::String(label, _)] = pair.as_slice() {
+                                if crate::sign::decode_text(stored) == text {
+                                    shown = crate::sign::decode_text(label);
+                                }
+                            }
+                        }
+                    }
+                }
+                let f = doc.get_dictionary_mut(field).map_err(err("Form field"))?;
+                f.set("V", text_string(&text));
+                f.remove(b"RV");
+                f.remove(b"I");
+                for w in widgets {
+                    text_appearance(doc, w, &shown)?;
+                }
+            }
+        }
+    }
+    // The values are drawn above, so readers need not redraw them, and the
+    // XML copy of the form (XFA) would now disagree with the fields.
+    let form = doc.catalog().ok().and_then(|c| c.get(b"AcroForm").ok().cloned());
+    match form {
+        Some(Object::Reference(id)) => {
+            if let Ok(d) = doc.get_dictionary_mut(id) {
+                d.remove(b"XFA");
+                d.remove(b"NeedAppearances");
+            }
+        }
+        Some(Object::Dictionary(mut d)) => {
+            d.remove(b"XFA");
+            d.remove(b"NeedAppearances");
+            if let Ok(c) = doc.catalog_mut() {
+                c.set("AcroForm", d);
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn color_op(doc: &Document, color: Option<&Object>, stroke: bool) -> Option<String> {
+    let Object::Array(a) = doc.dereference(color?).ok()?.1 else { return None };
+    let v: Vec<String> = a.iter().filter_map(num).map(|n| format!("{n:.3}")).collect();
+    let op = match (v.len(), stroke) {
+        (1, false) => "g",
+        (1, true) => "G",
+        (3, false) => "rg",
+        (3, true) => "RG",
+        (4, false) => "k",
+        (4, true) => "K",
+        _ => return None,
+    };
+    Some(format!("{} {op}\n", v.join(" ")))
+}
+
+/// Draw the value of a text field into the widget's appearance.
+fn text_appearance(doc: &mut Document, widget: ObjectId, text: &str) -> Res<()> {
+    let wd = doc.get_dictionary(widget).map_err(err("Form field"))?.clone();
+    let r: Vec<f32> = match wd.get(b"Rect").ok().and_then(|o| doc.dereference(o).ok()) {
+        Some((_, Object::Array(a))) => a.iter().filter_map(num).collect(),
+        _ => Vec::new(),
+    };
+    if r.len() != 4 {
+        return Ok(());
+    }
+    let (w, h) = ((r[2] - r[0]).abs(), (r[3] - r[1]).abs());
+    let flags = field_attr(doc, widget, b"Ff").and_then(|f| f.as_i64().ok()).unwrap_or(0);
+    let multiline = flags & (1 << 12) != 0;
+    let max_len = field_attr(doc, widget, b"MaxLen").and_then(|m| m.as_i64().ok()).filter(|m| *m > 0).map(|m| m as usize);
+    let comb = if flags & (1 << 24) != 0 { max_len } else { None };
+    let align = field_attr(doc, widget, b"Q").and_then(|q| q.as_i64().ok()).unwrap_or(0);
+    let da = field_attr(doc, widget, b"DA")
+        .or_else(|| {
+            let form = doc.catalog().ok()?.get(b"AcroForm").ok()?;
+            doc.dereference(form).ok()?.1.as_dict().ok()?.get(b"DA").ok().cloned()
+        })
+        .and_then(|o| o.as_str().ok().map(|b| String::from_utf8_lossy(b).to_string()))
+        .unwrap_or_default();
+    let mut size = crate::info::da_size(&da);
+
+    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+    let text = if multiline { text } else { text.replace('\n', " ") };
+    let mut ops = String::from("/Tx BMC\nq\n");
+    let mk = wd.get(b"MK").ok().and_then(|o| doc.dereference(o).ok()).and_then(|(_, o)| o.as_dict().ok().cloned());
+    if let Some(fill) = color_op(doc, mk.as_ref().and_then(|m| m.get(b"BG").ok()), false) {
+        ops.push_str(&format!("{fill}0 0 {w:.2} {h:.2} re f\n"));
+    }
+    if let Some(stroke) = color_op(doc, mk.as_ref().and_then(|m| m.get(b"BC").ok()), true) {
+        let bw = wd
+            .get(b"BS")
+            .ok()
+            .and_then(|o| doc.dereference(o).ok())
+            .and_then(|(_, o)| o.as_dict().ok())
+            .and_then(|d| d.get(b"W").ok())
+            .and_then(num)
+            .unwrap_or(1.0);
+        if bw > 0.0 {
+            ops.push_str(&format!("{stroke}{bw:.2} w {:.2} {:.2} {:.2} {:.2} re S\n", bw / 2.0, bw / 2.0, w - bw, h - bw));
+        }
+    }
+
+    let mut resources = Dictionary::new();
+    if !text.trim().is_empty() {
+        let font = embed_font(doc, &text)?;
+        let pad = 2.0;
+        if size <= 0.0 {
+            // Automatic size: fill the height, then shrink until one line fits the width.
+            size = if multiline { 10.0 } else { (h * 0.65).clamp(4.0, 12.0) };
+            if !multiline && comb.is_none() {
+                while size > 4.0 && font.width(&text, size) > w - 2.0 * pad {
+                    size -= 0.5;
+                }
+            }
+        }
+        ops.push_str(&format!("1 1 {:.2} {:.2} re W n\nBT\n/F1 {size:.2} Tf\n0 g\n", w - 2.0, h - 2.0));
+        let mut show = |x: f32, y: f32, s: &str| {
+            ops.push_str(&format!("1 0 0 1 {x:.2} {y:.2} Tm <{}> Tj\n", font.hex(s)));
+        };
+        let middle = (h - size * 0.72) / 2.0;
+        if let Some(cells) = comb {
+            // One character per box.
+            let cell = w / cells as f32;
+            for (i, c) in text.chars().take(cells).enumerate() {
+                let s = c.to_string();
+                show(i as f32 * cell + (cell - font.width(&s, size)) / 2.0, middle, &s);
+            }
+        } else if multiline {
+            let mut lines: Vec<String> = Vec::new();
+            for para in text.split('\n') {
+                let mut line = String::new();
+                for word in para.split(' ') {
+                    let candidate = if line.is_empty() { word.to_string() } else { format!("{line} {word}") };
+                    if !line.is_empty() && font.width(&candidate, size) > w - 2.0 * pad {
+                        lines.push(std::mem::take(&mut line));
+                        line = word.to_string();
+                    } else {
+                        line = candidate;
+                    }
+                }
+                lines.push(line);
+            }
+            for (i, line) in lines.iter().enumerate() {
+                show(pad, h - pad - size * 0.9 - i as f32 * size * 1.15, line);
+            }
+        } else {
+            let tw = font.width(&text, size);
+            let x = match align {
+                1 => ((w - tw) / 2.0).max(pad),
+                2 => (w - tw - pad).max(pad),
+                _ => pad,
+            };
+            show(x, middle, &text);
+        }
+        ops.push_str("ET\n");
+        resources.set("Font", dictionary! { "F1" => font.id });
+    }
+    ops.push_str("Q\nEMC\n");
+
+    let ap = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "FormType" => 1,
+            "BBox" => reals(&[0.0, 0.0, w, h]),
+            "Resources" => resources,
+        },
+        ops.into_bytes(),
+    ));
+    doc.get_dictionary_mut(widget).map_err(err("Form field"))?.set("AP", dictionary! { "N" => ap });
+    Ok(())
 }
 
 pub(crate) struct EmbeddedFont {
@@ -461,6 +858,37 @@ mod tests {
         if let Ok(dir) = std::env::var("PROTOPDF_OUT") {
             std::fs::write(std::path::Path::new(&dir).join(name), bytes).unwrap();
         }
+    }
+
+    #[test]
+    fn view_and_user_coordinates_round_trip() {
+        let bbox = [10.0, 20.0, 605.0, 862.0];
+        for rot in [0, 90, 180, 270] {
+            let ((ux, uy), _) = view_to_user(bbox, rot, 123.0, 45.0);
+            let (vx, vy) = user_to_view(bbox, rot, ux, uy);
+            assert!((vx - 123.0).abs() < 0.01 && (vy - 45.0).abs() < 0.01, "rotation {rot}");
+        }
+    }
+
+    #[test]
+    fn highlight_and_note_can_be_added_and_removed() {
+        let src = sample();
+        let marked = apply(&src, "", Op::Highlight { page: 0, rects: vec![[100.0, 100.0, 300.0, 114.0], [100.0, 116.0, 220.0, 130.0]], color: [1.0, 0.9, 0.2] }).unwrap();
+        let noted = apply(&marked, "", Op::AddNote { page: 0, x: 400.0, y: 60.0, text: "Провери цената".into() }).unwrap();
+        out("annotated.pdf", &noted);
+        let info = crate::info::extract(&noted, "").unwrap();
+        let notes = &info.pages[0].notes;
+        assert_eq!(notes.len(), 2);
+        let hl = notes.iter().find(|n| n.highlight).unwrap();
+        assert!((hl.rect[0] - 100.0).abs() < 0.5 && (hl.rect[3] - 130.0).abs() < 0.5, "{:?}", hl.rect);
+        let note = notes.iter().find(|n| !n.highlight).unwrap();
+        assert_eq!(note.text, "Провери цената");
+        assert!((note.rect[0] - 400.0).abs() < 0.5 && (note.rect[1] - 60.0).abs() < 0.5, "{:?}", note.rect);
+
+        let removed = apply(&noted, "", Op::DeleteAnnot { page: 0, id: hl.id }).unwrap();
+        let left = &crate::info::extract(&removed, "").unwrap().pages[0].notes;
+        assert_eq!(left.len(), 1);
+        assert!(!left[0].highlight);
     }
 
     #[test]

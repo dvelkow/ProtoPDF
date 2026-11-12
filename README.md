@@ -9,6 +9,8 @@ Reading
 - Page list with thumbnails
 - Find text in the whole document, with highlights and next / previous
 - Select text with the mouse and copy it
+- Links work: links to other pages jump there (Alt+Left goes back), web and mail links open in the browser or mail program
+- Contents panel with the document's bookmarks, next to the page thumbnails
 - Password protected files
 - Fonts that a PDF names but does not embed are taken from Windows, so Cyrillic text shows correctly
 
@@ -18,6 +20,8 @@ Editing
 - Insert another PDF after the current page or at the end
 - Save chosen pages as a new PDF (for example `1-3, 5`)
 - Write text on a page, any script, in black, blue or red
+- Highlight selected text and stick notes on a page. They are saved as standard PDF comments, so other readers show them too, and comments made elsewhere can be read and removed here
+- Fill in forms: text boxes (also the one character per box kind), multi-line boxes, tick boxes, radio buttons and drop-down lists. Tab moves to the next box
 - Undo and redo for every edit. Nothing is written to disk until you press Save
 
 Digital signatures
@@ -67,6 +71,8 @@ Windows does not allow a program to appoint itself as the default. That last ste
 | Ctrl+F, F3, Shift+F3 | Find, next, previous |
 | Ctrl+C, Ctrl+A | Copy selection, select all text on the page |
 | Ctrl+Z, Ctrl+Y | Undo, redo |
+| Ctrl+H | Highlight the selected text |
+| Alt+Left | Back to where a link was followed |
 | Ctrl+R | Rotate the page right |
 | Ctrl + mouse wheel, Ctrl+Plus, Ctrl+Minus | Zoom |
 | Ctrl+1, Ctrl+2, Ctrl+0 | Actual size, fit width, fit page |
@@ -96,7 +102,7 @@ ProtoPDF.exe --unregister                  remove the registration
 | Signatures | Windows CryptoAPI through the windows crate: PKCS#7 signing, verification, certificate chains, timestamps |
 | Print dialog, printing, registry | [windows](https://github.com/microsoft/windows-rs), [winreg](https://github.com/gentoo90/winreg-rs) |
 
-Source layout: `src/render.rs` (background render threads), `src/text.rs` (search and selection), `src/edit.rs` (edits), `src/sign.rs` (signatures), `src/print.rs`, `src/register.rs`, `src/app.rs` (the window).
+Source layout: `src/render.rs` (background render threads), `src/text.rs` (search and selection), `src/edit.rs` (edits, comments, form filling), `src/info.rs` (links, contents, comments and form fields read from the file), `src/sign.rs` (signatures), `src/print.rs`, `src/register.rs`, `src/app.rs` (the window).
 
 ## Tests
 
@@ -110,7 +116,8 @@ cargo test --release
 ## Limits
 
 - Windows only
-- Filling in PDF form fields and comments are not supported
+- Forms: calculated fields, scripts inside the form and XFA-only forms are not supported, and existing text inside the page cannot be changed
+- Links to other files and attached files are not followed
 - A signer counts as trusted when Windows trusts the issuer of the certificate. The EU trusted list is not consulted, so a qualified signature from an issuer whose root certificate is not installed in Windows shows as "identity could not be confirmed" even though the document check passes
 - New signatures use the adbe.pkcs7.detached format with SHA-256 and the time of this computer. They do not carry a timestamp from a timestamp authority
 - Password protected PDFs cannot be signed

@@ -2,6 +2,7 @@
 
 mod app;
 mod edit;
+mod info;
 mod print;
 mod register;
 mod render;
