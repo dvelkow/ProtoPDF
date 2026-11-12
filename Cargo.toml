@@ -3,6 +3,7 @@ name = "protopdf"
 version = "0.1.0"
 edition = "2021"
 description = "Minimal PDF reader with page editing and printing"
+rust-version = "1.95"
 
 [[bin]]
 name = "ProtoPDF"
@@ -17,11 +18,13 @@ lopdf = "0.47"
 rfd = "0.18"
 ttf-parser = "0.25"
 subsetter = "0.2"
-winreg = "0.56"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
-[dependencies.windows]
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+
+[target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
 features = [
     "Win32_Foundation",
@@ -38,6 +41,10 @@ features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_System_Memory",
 ]
+
+# Linux: signatures are checked and made with OpenSSL (the system libssl).
+[target.'cfg(not(windows))'.dependencies]
+openssl = "0.10"
 
 [build-dependencies]
 winresource = "0.1"

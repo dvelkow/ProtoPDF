@@ -165,6 +165,9 @@ enum Act {
     Save,
     SaveAs,
     Print,
+    /// Linux: the print dialog was confirmed.
+    #[cfg(not(windows))]
+    PrintGo(print::PrintJob),
     Undo,
     Redo,
     Copy,
@@ -267,6 +270,12 @@ pub struct App {
     status: String,
     edit_rx: Option<Receiver<EditDone>>,
     print_rx: Option<Receiver<print::Progress>>,
+    /// Linux: the open print dialog.
+    #[cfg(not(windows))]
+    print_setup: Option<print::Setup>,
+    /// Linux: the certificate file (.p12 / .pfx) to sign with, and its password.
+    #[cfg(not(windows))]
+    p12: (Option<PathBuf>, String),
     confirm_close: bool,
     force_close: bool,
     jobs_view: Vec<Job>,
@@ -338,6 +347,10 @@ impl App {
             status: String::new(),
             edit_rx: None,
             print_rx: None,
+            #[cfg(not(windows))]
+            print_setup: None,
+            #[cfg(not(windows))]
+            p12: (None, String::new()),
             confirm_close: false,
             force_close: false,
             jobs_view: Vec::new(),
@@ -872,6 +885,15 @@ impl App {
         (!s.trim().is_empty()).then_some(s)
     }
 
+    fn start_print(&mut self, ctx: &egui::Context, job: print::PrintJob) {
+        let Some(doc) = &self.doc else { return };
+        let (tx, rx) = channel();
+        let ctx2 = ctx.clone();
+        print::start(job, doc.bytes.clone(), doc.password.clone(), doc.name(), tx, move || ctx2.request_repaint());
+        self.print_rx = Some(rx);
+        self.status = "Printing...".into();
+    }
+
     fn act(&mut self, ctx: &egui::Context, act: Act) {
         let n = self.doc.as_ref().map_or(0, |d| d.sizes.len());
         let cur = self.cur_page.min(n.saturating_sub(1));
@@ -927,14 +949,20 @@ impl App {
                 if !doc.loaded || self.print_rx.is_some() {
                     return;
                 }
+                #[cfg(windows)]
                 if let Some(job) = print::choose_printer(n, cur) {
-                    let (tx, rx) = channel();
-                    let ctx2 = ctx.clone();
-                    print::start(job, doc.bytes.clone(), doc.password.clone(), doc.name(), tx, move || {
-                        ctx2.request_repaint()
-                    });
-                    self.print_rx = Some(rx);
-                    self.status = "Printing...".into();
+                    self.start_print(ctx, job);
+                }
+                #[cfg(not(windows))]
+                {
+                    self.print_setup = Some(print::Setup::new(n, cur));
+                }
+            }
+            #[cfg(not(windows))]
+            Act::PrintGo(job) => {
+                self.print_setup = None;
+                if self.doc.as_ref().is_some_and(|d| d.loaded) && self.print_rx.is_none() {
+                    self.start_print(ctx, job);
                 }
             }
             Act::Undo => {
@@ -1105,13 +1133,12 @@ impl App {
                 self.show_thumbs = !self.show_thumbs;
                 self.thumb_follow = usize::MAX;
             }
-            Act::MakeDefault => match std::env::current_exe().map_err(|e| e.to_string()).and_then(|exe| register::register(&exe)) {
-                Ok(()) => {
-                    register::open_settings();
-                    self.status = "In the Windows page that opened, choose ProtoPDF for .pdf".into();
+            Act::MakeDefault => {
+                match std::env::current_exe().map_err(|e| e.to_string()).and_then(|exe| register::register(&exe)).and_then(|()| register::make_default()) {
+                    Ok(msg) => self.status = msg,
+                    Err(e) => self.error = Some(format!("Could not make ProtoPDF the default PDF app\n{e}")),
                 }
-                Err(e) => self.error = Some(format!("Could not register with Windows\n{e}")),
-            },
+            }
             Act::Password(pw) => {
                 self.password = None;
                 match (pw, self.doc.as_mut()) {
@@ -1200,6 +1227,7 @@ impl App {
                 if self.busy() || !doc.loaded {
                     return;
                 }
+                #[cfg(windows)]
                 let cert = match sign::pick_certificate() {
                     Ok(Some(cert)) => cert,
                     Ok(None) => return,
@@ -1207,6 +1235,20 @@ impl App {
                         self.error = Some(e);
                         return;
                     }
+                };
+                #[cfg(not(windows))]
+                let cert = match self.p12.0.as_deref() {
+                    None => {
+                        self.error = Some("Choose your certificate file (.p12 or .pfx) first.".into());
+                        return;
+                    }
+                    Some(file) => match sign::load_p12(file, &self.p12.1) {
+                        Ok(cert) => cert,
+                        Err(e) => {
+                            self.error = Some(e);
+                            return;
+                        }
+                    },
                 };
                 let options = sign::SignOptions {
                     page: d.page,
@@ -1232,7 +1274,7 @@ impl App {
                 self.edit_rx = Some(rx);
                 self.sign_draft = None;
                 self.tool = Tool::Select;
-                self.status = "Signing... Windows may ask for the PIN of your signature".into();
+                self.status = if cfg!(windows) { "Signing... Windows may ask for the PIN of your signature" } else { "Signing..." }.into();
             }
             Act::ShowSigs => self.show_sigs = !self.show_sigs,
             Act::EditSigned(yes) => {
@@ -1251,7 +1293,11 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
         let typing = ctx.egui_wants_keyboard_input();
-        let modal = self.password.is_some() || self.error.is_some() || self.confirm_close || self.extract.is_some() || self.pending_edit.is_some();
+        #[cfg(not(windows))]
+        let printing = self.print_setup.is_some();
+        #[cfg(windows)]
+        let printing = false;
+        let modal = printing || self.password.is_some() || self.error.is_some() || self.confirm_close || self.extract.is_some() || self.pending_edit.is_some();
         let hit = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
         let ctrl = Modifiers::COMMAND;
         let ctrl_shift = Modifiers::COMMAND | Modifiers::SHIFT;
@@ -2438,6 +2484,15 @@ impl App {
             }
         }
 
+        #[cfg(not(windows))]
+        if let Some(setup) = self.print_setup.as_mut() {
+            match setup.show(ctx) {
+                Some(Some(job)) => acts.push(Act::PrintGo(job)),
+                Some(None) => self.print_setup = None,
+                None => {}
+            }
+        }
+
         if let Some(range) = self.extract.as_mut() {
             let n = self.doc.as_ref().map_or(0, |d| d.sizes.len());
             let mut close = false;
@@ -2521,6 +2576,8 @@ impl App {
             }
         }
 
+        #[cfg(not(windows))]
+        let p12 = &mut self.p12;
         if let Some(d) = self.sign_draft.as_mut() {
             let mut open = true;
             egui::Window::new("Sign document")
@@ -2544,8 +2601,37 @@ impl App {
                         ui.end_row();
                     });
                     ui.add_space(6.0);
+                    #[cfg(windows)]
                     if ui.button("Choose certificate and sign...").clicked() {
                         acts.push(Act::SignGo);
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        egui::Grid::new("sign_cert").num_columns(2).show(ui, |ui| {
+                            ui.label("Certificate");
+                            ui.horizontal(|ui| {
+                                let shown = p12.0.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().to_string());
+                                ui.add_sized([150.0, 18.0], egui::Label::new(shown.as_deref().unwrap_or("none chosen")).truncate());
+                                if ui.button("Choose...").clicked() {
+                                    let mut dlg = rfd::FileDialog::new().add_filter("Certificate file", &["p12", "pfx", "P12", "PFX"]).set_title("Certificate file");
+                                    if let Some(dir) = p12.0.as_ref().and_then(|p| p.parent()) {
+                                        dlg = dlg.set_directory(dir);
+                                    }
+                                    if let Some(f) = dlg.pick_file() {
+                                        p12.0 = Some(f);
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                            ui.label("Password");
+                            ui.add(egui::TextEdit::singleline(&mut p12.1).password(true).desired_width(220.0));
+                            ui.end_row();
+                        });
+                        ui.add_space(6.0);
+                        if ui.add_enabled(p12.0.is_some(), egui::Button::new("Sign...")).clicked() {
+                            acts.push(Act::SignGo);
+                        }
+                        ui.label("Signs with a .p12 / .pfx file that holds your certificate and private key.");
                     }
                     ui.label("The signed document is saved as a new file.");
                 });
@@ -2801,6 +2887,9 @@ impl App {
                 return;
             }
             "editsigned" => Act::EditSigned(true),
+            // Opens the print dialog (Linux only: the Windows one would block the automation).
+            #[cfg(not(windows))]
+            "print" => Act::Print,
             "placesig" => {
                 let mut it = arg.split(',');
                 let x = it.next().and_then(|v| v.parse().ok()).unwrap_or(40.0);

@@ -714,13 +714,21 @@ fn add_text(doc: &mut Document, page: ObjectId, x: f32, y: f32, text: &str, size
     Ok(())
 }
 
-/// Embed a subset of a Windows font that covers `text` as an Identity-H
+/// Embed a subset of a system font that covers `text` as an Identity-H
 /// composite font, so that any script (Cyrillic included) can be written.
 pub(crate) fn embed_font(doc: &mut Document, text: &str) -> Res<EmbeddedFont> {
-    let data = ["arial.ttf", "segoeui.ttf", "tahoma.ttf", "verdana.ttf"]
-        .iter()
-        .find_map(|f| std::fs::read(crate::fonts_dir().join(f)).ok())
-        .ok_or("No usable font found in the Windows Fonts folder.")?;
+    let data = crate::fonts::find(&[
+        "arial.ttf",
+        "segoeui.ttf",
+        "tahoma.ttf",
+        "verdana.ttf",
+        // Linux
+        "LiberationSans-Regular.ttf",
+        "Arimo-Regular.ttf",
+        "DejaVuSans.ttf",
+        "NotoSans-Regular.ttf",
+    ])
+    .ok_or("No usable font found (Arial, Liberation Sans or DejaVu Sans).")?;
     let face = ttf_parser::Face::parse(&data, 0).map_err(err("Font"))?;
     let upem = face.units_per_em().max(1) as f32;
     let k = 1000.0 / upem;

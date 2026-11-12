@@ -103,3 +103,10 @@ pub fn open_settings() {
         ShellExecuteW(None, w!("open"), &url, PCWSTR::null(), PCWSTR::null(), SW_SHOWNORMAL);
     }
 }
+
+/// Windows does not let a program make itself the default PDF app: open the
+/// Settings page where the user does it. Returns what to tell the user.
+pub fn make_default() -> Result<String, String> {
+    open_settings();
+    Ok("In the Windows page that opened, choose ProtoPDF for .pdf".into())
+}

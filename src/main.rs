@@ -2,18 +2,19 @@
 
 mod app;
 mod edit;
+mod fonts;
 mod info;
+#[cfg_attr(windows, path = "print_windows.rs")]
+#[cfg_attr(not(windows), path = "print_linux.rs")]
 mod print;
+#[cfg_attr(windows, path = "register_windows.rs")]
+#[cfg_attr(not(windows), path = "register_linux.rs")]
 mod register;
 mod render;
 mod sign;
 mod text;
 
 use std::path::PathBuf;
-
-pub fn fonts_dir() -> PathBuf {
-    PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into())).join("Fonts")
-}
 
 static ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
@@ -23,21 +24,27 @@ fn main() {
     let args: Vec<String> = raw.iter().map(|a| a.to_string_lossy().into_owned()).collect();
 
     match args.first().map(String::as_str) {
-        // ProtoPDF --register [--quiet]: add the program to Windows' list of PDF apps.
+        // ProtoPDF --register [--quiet]: add the program to the system's list of PDF apps.
+        // Without --quiet it also becomes the default (on Windows: opens the page where the user picks it).
         Some("--register") => {
             let exe = std::env::current_exe().expect("exe path");
-            let code = match register::register(&exe) {
-                Ok(()) => {
-                    if !args.iter().any(|a| a == "--quiet") {
-                        register::open_settings();
-                    }
+            let mut res = register::register(&exe).map(|()| "Registered as a PDF app".to_string());
+            if res.is_ok() && !args.iter().any(|a| a == "--quiet") {
+                res = register::make_default();
+            }
+            let code = match res {
+                Ok(msg) => {
+                    println!("{msg}");
                     0
                 }
-                Err(_) => 1,
+                Err(e) => {
+                    eprintln!("{e}");
+                    1
+                }
             };
             std::process::exit(code);
         }
-        // ProtoPDF --unregister: remove the program from Windows' list of PDF apps.
+        // ProtoPDF --unregister: remove the program from the system's list of PDF apps.
         Some("--unregister") => {
             register::unregister();
             std::process::exit(0);
@@ -48,7 +55,10 @@ fn main() {
             let code = match args.get(1) {
                 Some(file) => match print::print_file(std::path::Path::new(file), opt("--printer").as_deref(), opt("--output").as_deref()) {
                     Ok(()) => 0,
-                    Err(_) => 1,
+                    Err(e) => {
+                        eprintln!("{e}");
+                        1
+                    }
                 },
                 None => 1,
             };
@@ -93,12 +103,19 @@ fn main() {
         }
         // ProtoPDF --sign in.pdf out.pdf --thumbprint HEX [--page N] [--rect x0,y0,x1,y1] [--reason text] [--location text]
         // signs with the certificate that has this SHA-1 thumbprint in the Windows store.
+        // On Linux: --p12 file.p12 instead of --thumbprint, the password in the PROTOPDF_P12_PASSWORD variable.
         Some("--sign") => {
             let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
             let run = || -> Result<(), String> {
                 let (input, output) = (args.get(1).ok_or("input")?, args.get(2).ok_or("output")?);
+                #[cfg(windows)]
                 let cert = sign::find_certificate(&opt("--thumbprint").ok_or("--thumbprint is required")?)
                     .ok_or("No signing certificate with this thumbprint")?;
+                #[cfg(not(windows))]
+                let cert = sign::load_p12(
+                    std::path::Path::new(&opt("--p12").ok_or("--p12 file.p12 is required")?),
+                    &std::env::var("PROTOPDF_P12_PASSWORD").unwrap_or_default(),
+                )?;
                 let rect = opt("--rect").and_then(|r| {
                     let v: Vec<f32> = r.split(',').filter_map(|x| x.trim().parse().ok()).collect();
                     (v.len() == 4).then(|| [v[0], v[1], v[2], v[3]])

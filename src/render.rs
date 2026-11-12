@@ -312,8 +312,9 @@ impl<'a> Device<'a> for TextDevice {
     }
 }
 
-/// Fonts that a PDF names but does not embed are taken from Windows, so that
-/// Cyrillic text in such files shows correctly. The built-in fonts are the fallback.
+/// Fonts that a PDF names but does not embed are taken from the system (Arial,
+/// Times New Roman and Courier New on Windows, the Liberation fonts on Linux), so
+/// that Cyrillic text in such files shows correctly. The built-in fonts are the fallback.
 pub fn interpreter_settings() -> InterpreterSettings {
     InterpreterSettings {
         font_resolver: Arc::new(|query| match query {
@@ -328,26 +329,24 @@ pub fn interpreter_settings() -> InterpreterSettings {
 }
 
 fn system_font(font: &StandardFont) -> Option<(FontData, u32)> {
-    let file = match font {
-        StandardFont::Helvetica => "arial.ttf",
-        StandardFont::HelveticaBold => "arialbd.ttf",
-        StandardFont::HelveticaOblique => "ariali.ttf",
-        StandardFont::HelveticaBoldOblique => "arialbi.ttf",
-        StandardFont::Courier => "cour.ttf",
-        StandardFont::CourierBold => "courbd.ttf",
-        StandardFont::CourierOblique => "couri.ttf",
-        StandardFont::CourierBoldOblique => "courbi.ttf",
-        StandardFont::TimesRoman => "times.ttf",
-        StandardFont::TimesBold => "timesbd.ttf",
-        StandardFont::TimesItalic => "timesi.ttf",
-        StandardFont::TimesBoldItalic => "timesbi.ttf",
+    // Windows names first, then fonts with the same widths found on Linux.
+    let files: &'static [&'static str] = match font {
+        StandardFont::Helvetica => &["arial.ttf", "LiberationSans-Regular.ttf", "Arimo-Regular.ttf"],
+        StandardFont::HelveticaBold => &["arialbd.ttf", "LiberationSans-Bold.ttf", "Arimo-Bold.ttf"],
+        StandardFont::HelveticaOblique => &["ariali.ttf", "LiberationSans-Italic.ttf", "Arimo-Italic.ttf"],
+        StandardFont::HelveticaBoldOblique => &["arialbi.ttf", "LiberationSans-BoldItalic.ttf", "Arimo-BoldItalic.ttf"],
+        StandardFont::Courier => &["cour.ttf", "LiberationMono-Regular.ttf", "Cousine-Regular.ttf"],
+        StandardFont::CourierBold => &["courbd.ttf", "LiberationMono-Bold.ttf", "Cousine-Bold.ttf"],
+        StandardFont::CourierOblique => &["couri.ttf", "LiberationMono-Italic.ttf", "Cousine-Italic.ttf"],
+        StandardFont::CourierBoldOblique => &["courbi.ttf", "LiberationMono-BoldItalic.ttf", "Cousine-BoldItalic.ttf"],
+        StandardFont::TimesRoman => &["times.ttf", "LiberationSerif-Regular.ttf", "Tinos-Regular.ttf"],
+        StandardFont::TimesBold => &["timesbd.ttf", "LiberationSerif-Bold.ttf", "Tinos-Bold.ttf"],
+        StandardFont::TimesItalic => &["timesi.ttf", "LiberationSerif-Italic.ttf", "Tinos-Italic.ttf"],
+        StandardFont::TimesBoldItalic => &["timesbi.ttf", "LiberationSerif-BoldItalic.ttf", "Tinos-BoldItalic.ttf"],
         StandardFont::ZapfDingBats | StandardFont::Symbol => return None,
     };
     static FONTS: OnceLock<Mutex<HashMap<&'static str, Option<Arc<Vec<u8>>>>>> = OnceLock::new();
     let mut map = FONTS.get_or_init(Default::default).lock().ok()?;
-    let data = map
-        .entry(file)
-        .or_insert_with(|| std::fs::read(crate::fonts_dir().join(file)).ok().map(Arc::new))
-        .clone()?;
+    let data = map.entry(files[0]).or_insert_with(|| crate::fonts::find(files).map(Arc::new)).clone()?;
     Some((data, 0))
 }
