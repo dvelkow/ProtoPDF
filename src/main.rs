@@ -14,7 +14,7 @@ pub fn fonts_dir() -> PathBuf {
     PathBuf::from(std::env::var_os("WINDIR").unwrap_or_else(|| "C:\\Windows".into())).join("Fonts")
 }
 
-static ICON_PNG: &[u8] = include_bytes!("../assets/icon64.png");
+static ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
 fn main() {
     // File names are taken as Windows gives them; they are not always valid Unicode.

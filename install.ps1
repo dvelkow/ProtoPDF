@@ -10,13 +10,12 @@ $dir = Join-Path $env:LOCALAPPDATA 'Programs\ProtoPDF'
 $exe = Join-Path $dir 'ProtoPDF.exe'
 New-Item -ItemType Directory -Force $dir | Out-Null
 # A running copy cannot be overwritten, but it can be renamed: open windows keep working
-# from the old file and the next start uses the new one.
-$old = Join-Path $dir 'ProtoPDF.old.exe'
-Remove-Item $old -Force -ErrorAction SilentlyContinue
+# from the old file and the next start uses the new one. Leftovers are removed once free.
+Get-ChildItem $dir -Filter 'ProtoPDF.old*.exe' | Remove-Item -Force -ErrorAction SilentlyContinue
 try {
     Copy-Item $src $exe -Force
 } catch {
-    Move-Item $exe $old -Force
+    Move-Item $exe (Join-Path $dir ("ProtoPDF.old-{0}.exe" -f (Get-Date -Format 'yyyyMMddHHmmss')))
     Copy-Item $src $exe -Force
 }
 
@@ -31,6 +30,9 @@ $s.Save()
 # Writes the "can open .pdf" entries under HKEY_CURRENT_USER.
 $p = Start-Process -FilePath $exe -ArgumentList '--register', '--quiet' -Wait -PassThru
 if ($p.ExitCode -ne 0) { throw "Registration failed (exit code $($p.ExitCode))" }
+
+# Ask Explorer to reload icons, so a changed program icon shows without signing out.
+Start-Process ie4uinit.exe -ArgumentList '-show' -ErrorAction SilentlyContinue
 
 "Installed: $exe"
 "Shortcut:  $lnk"
