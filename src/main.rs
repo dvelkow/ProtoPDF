@@ -11,8 +11,10 @@ mod print;
 #[cfg_attr(not(windows), path = "register_linux.rs")]
 mod register;
 mod render;
+mod settings;
 mod sign;
 mod text;
+mod theme;
 
 use std::path::PathBuf;
 
@@ -157,10 +159,18 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .map(PathBuf::from);
 
+    // --size 1440x900: start with this window size (for screenshots).
+    let size = args
+        .iter()
+        .position(|a| a == "--size")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|s| s.split_once('x'))
+        .and_then(|(w, h)| Some([w.parse::<f32>().ok()?, h.parse::<f32>().ok()?]))
+        .unwrap_or([1280.0, 860.0]);
     let mut viewport = eframe::egui::ViewportBuilder::default()
         .with_title("ProtoPDF")
         .with_app_id("ProtoPDF")
-        .with_inner_size([1100.0, 860.0])
+        .with_inner_size(size)
         .with_min_inner_size([520.0, 380.0])
         .with_drag_and_drop(true);
     if let Ok(icon) = eframe::icon_data::from_png_bytes(ICON_PNG) {

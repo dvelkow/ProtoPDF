@@ -72,6 +72,8 @@ impl SigInfo {
 pub fn summary(sigs: &[SigInfo]) -> (Level, String) {
     let names: Vec<&str> = sigs.iter().filter(|s| !s.is_timestamp).map(|s| s.signer.as_str()).filter(|n| !n.is_empty()).collect();
     let who = if names.is_empty() { "Signed".to_string() } else { format!("Signed by {}", names.join(", ")) };
+    // "Ltd." already ends the sentence.
+    let who = who.trim_end_matches('.');
     let worst = sigs.iter().map(SigInfo::level).max().unwrap_or(Level::Good);
     let changed_after = sigs.last().is_some_and(|s| !s.whole);
     match worst {

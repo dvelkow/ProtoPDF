@@ -5,12 +5,14 @@ use crate::info::{DocInfo, Target, WidgetKind};
 use crate::print;
 use crate::register;
 use crate::render::{Job, Kind, OpenError, Out, Pool};
+use crate::settings::Settings;
 use crate::sign::{self, Level, SigInfo};
 use crate::text::{PageText, lower_chars};
+use crate::theme::{self, Icon, Palette};
 use eframe::egui::{
-    self, Align, Align2, Color32, CursorIcon, FontId, Key, Layout as UiLayout, Modifiers, Pos2,
-    Rect, ScrollArea, Sense, Stroke, StrokeKind, TextureHandle, TextureOptions, Vec2,
-    ViewportCommand, pos2, vec2,
+    self, Align, Align2, Color32, CursorIcon, FontId, Frame, Key, Layout as UiLayout, Margin,
+    Modifiers, Pos2, Rect, RichText, ScrollArea, Sense, Shadow, Stroke, StrokeKind, TextureHandle,
+    TextureOptions, Vec2, ViewportCommand, pos2, vec2,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -23,8 +25,11 @@ const PT_TO_PX: f32 = 96.0 / 72.0;
 const GAP: f32 = 14.0;
 const MARGIN: f32 = 18.0;
 const THUMB_PX: u32 = 180;
-const THUMB_W: f32 = 112.0;
-const THUMB_PANEL: f32 = 150.0;
+const SIDEBAR_W: f32 = 248.0;
+const PANEL_W: f32 = 300.0;
+/// Room left under the last page and above a fitted page for the floating find bar.
+const BOTTOM_PAD: f32 = 170.0;
+const FIND_BAR_ROOM: f32 = 84.0;
 const TEX_BUDGET: usize = 420 << 20;
 const ZOOMS: [f32; 16] =
     [0.25, 0.33, 0.5, 0.67, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0, 4.0, 6.0];
@@ -53,6 +58,7 @@ enum Tool {
 enum SideTab {
     Pages,
     Contents,
+    Comments,
 }
 
 /// A sticky note being written.
@@ -202,6 +208,8 @@ enum Act {
     ShowSigs,
     EditSigned(bool),
     ToggleThumbs,
+    TogglePanel,
+    ToggleTheme,
     MakeDefault,
     Password(Option<String>),
     CloseAnswer(u8),
@@ -314,14 +322,30 @@ pub struct App {
     /// Places to return to after following links: page and height on it.
     back: Vec<(usize, f32)>,
     jump_offset: f32,
-    /// What the pointer is over (a link target), shown in the status bar.
+    /// What the pointer is over (a link target), shown at the top of the page view.
     hover: Option<String>,
+    settings: Settings,
+    pal: Palette,
+    /// The document panel on the right.
+    show_panel: bool,
+    /// The signature notice above the find bar was closed.
+    sig_hidden: bool,
 }
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, file: Option<PathBuf>, shot: Option<PathBuf>) -> Self {
         // Ctrl +/- zoom the document, not the whole interface.
         cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        let args: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
+        let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+        let mut settings = Settings::load();
+        // --theme light|dark: for screenshots; not remembered.
+        if let Some(t) = arg("--theme") {
+            settings.light = t == "light";
+            settings.persist = false;
+        }
+        theme::install(&cc.egui_ctx, !settings.light);
+        let pal = theme::palette(!settings.light);
         let mut app = Self {
             doc: None,
             zoom: 1.0,
@@ -380,11 +404,18 @@ impl App {
             back: Vec::new(),
             jump_offset: 0.0,
             hover: None,
+            show_panel: settings.panel,
+            settings,
+            pal,
+            sig_hidden: false,
         };
         // Switches used when taking automated screenshots.
-        let args: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
-        let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
-        app.show_thumbs = args.iter().any(|a| a == "--thumbs");
+        app.show_thumbs = app.settings.sidebar || args.iter().any(|a| a == "--thumbs");
+        if args.iter().any(|a| a == "--no-panel") {
+            app.show_panel = false;
+        }
+        // The find box is always on screen.
+        app.search.open = true;
         if let Some(q) = arg("--find") {
             app.search.open = true;
             app.search.query = q;
@@ -438,8 +469,10 @@ impl App {
                 self.pending_edit = None;
                 self.show_sigs = false;
                 self.back.clear();
+                self.sig_hidden = false;
                 self.check_signatures(ctx);
                 self.read_info(ctx);
+                self.settings.add_recent(path);
             }
             Err(e) => self.error = Some(format!("Cannot open {}\n{e}", path.display())),
         }
@@ -757,7 +790,7 @@ impl App {
             .unwrap_or(0.0);
         let target = top + y * lay.ppt;
         // Leave the view alone if the hit is already comfortably on screen.
-        if target < self.scroll.y + 20.0 || target > self.scroll.y + self.view_size.y - 80.0 {
+        if target < self.scroll.y + 20.0 || target > self.scroll.y + self.view_size.y - 80.0 - self.bottom_room() {
             self.set_scroll = Some(vec2(self.scroll.x, (target - self.view_size.y * 0.3).max(0.0)));
         }
     }
@@ -795,11 +828,17 @@ impl App {
             }
             Fit::Page => {
                 let (w, h) = doc.sizes[self.cur_page.min(doc.sizes.len() - 1)];
-                let avail_h = (self.view_size.y - 2.0 * GAP).max(50.0);
+                let avail_h = (self.view_size.y - 2.0 * GAP - self.bottom_room()).max(50.0);
                 (avail_w / (w * PT_TO_PX)).min(avail_h / (h * PT_TO_PX))
             }
         }
         .clamp(0.1, 6.0)
+    }
+
+    /// Height covered by the floating find bar, and by the notice above it when one shows.
+    fn bottom_room(&self) -> f32 {
+        let signed_notice = !self.sigs.is_empty() && !self.sig_hidden && self.sig_rx.is_none();
+        FIND_BAR_ROOM + if signed_notice || self.tool != Tool::Select { 54.0 } else { 0.0 }
     }
 
     fn busy(&self) -> bool {
@@ -837,7 +876,7 @@ impl App {
             Ok(()) => {
                 doc.saved = doc.bytes.clone();
                 doc.path = Some(path.to_path_buf());
-                self.status = format!("Saved {}", path.display());
+                self.status = format!("Saved {}", path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().to_string()));
                 true
             }
             Err(e) => {
@@ -1132,6 +1171,19 @@ impl App {
             Act::ToggleThumbs => {
                 self.show_thumbs = !self.show_thumbs;
                 self.thumb_follow = usize::MAX;
+                self.settings.sidebar = self.show_thumbs;
+                self.settings.save();
+            }
+            Act::TogglePanel => {
+                self.show_panel = !self.show_panel;
+                self.settings.panel = self.show_panel;
+                self.settings.save();
+            }
+            Act::ToggleTheme => {
+                self.settings.light = !self.settings.light;
+                self.pal = theme::palette(!self.settings.light);
+                theme::set_dark(ctx, !self.settings.light);
+                self.settings.save();
             }
             Act::MakeDefault => {
                 match std::env::current_exe().map_err(|e| e.to_string()).and_then(|exe| register::register(&exe)).and_then(|()| register::make_default()) {
@@ -1360,12 +1412,16 @@ impl App {
                 self.note_open = None;
                 self.active_field = None;
             } else if self.draft.is_some() || self.sign_draft.is_some() || self.note_draft.is_some() || self.tool != Tool::Select {
+                if self.tool != Tool::Select {
+                    // The "click on the page..." hint no longer applies.
+                    self.status.clear();
+                }
                 self.draft = None;
                 self.sign_draft = None;
                 self.note_draft = None;
                 self.tool = Tool::Select;
-            } else if self.search.open {
-                self.search.open = false;
+            } else if !self.search.query.is_empty() {
+                self.search.query.clear();
             } else {
                 self.sel = None;
             }
@@ -1426,13 +1482,30 @@ impl App {
         }
     }
 
-    fn top_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+    /// Edits since the last save, counted back through the undo list. `None` when
+    /// the saved version is not in the list (after undoing past a save).
+    fn unsaved_count(&self) -> Option<usize> {
+        let d = self.doc.as_ref()?;
+        if !d.dirty() {
+            return Some(0);
+        }
+        d.undo.iter().rev().position(|(b, _)| Arc::ptr_eq(b, &d.saved)).map(|k| k + 1)
+    }
+
+    fn recent_files(&self, max: usize) -> Vec<PathBuf> {
+        self.settings.recent.iter().filter(|p| p.exists()).take(max).cloned().collect()
+    }
+
+    /// The menu behind the file name: every command, including the ones without a button.
+    fn title_menu(&self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
         let has = self.doc.as_ref().is_some_and(|d| d.loaded);
         let n = self.doc.as_ref().map_or(0, |d| d.sizes.len());
         let dirty = self.is_dirty();
         let can_undo = self.doc.as_ref().is_some_and(|d| !d.undo.is_empty());
         let can_redo = self.doc.as_ref().is_some_and(|d| !d.redo.is_empty());
         let edit_ok = has && !self.busy();
+        let has_sel = self.sel.is_some();
+        let cur = self.cur_page;
         let item = |ui: &mut egui::Ui, on: bool, label: &str, keys: &str| -> bool {
             let mut b = egui::Button::new(label);
             if !keys.is_empty() {
@@ -1444,454 +1517,959 @@ impl App {
             }
             clicked
         };
+        ui.set_min_width(250.0);
+        if item(ui, true, "Open...", "Ctrl+O") {
+            acts.push(Act::Open);
+        }
+        let recent = self.recent_files(8);
+        ui.add_enabled_ui(!recent.is_empty(), |ui| {
+            ui.menu_button("Open recent", |ui| {
+                for p in &recent {
+                    let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    if ui.button(name).on_hover_text(p.display().to_string()).clicked() {
+                        acts.push(Act::OpenPath(p.clone()));
+                        ui.close();
+                    }
+                }
+            });
+        });
+        if item(ui, has && dirty, "Save", "Ctrl+S") {
+            acts.push(Act::Save);
+        }
+        if item(ui, has, "Save as...", "Ctrl+Shift+S") {
+            acts.push(Act::SaveAs);
+        }
+        if item(ui, has, "Print...", "Ctrl+P") {
+            acts.push(Act::Print);
+        }
+        ui.separator();
+        ui.menu_button("Edit", |ui| {
+            if item(ui, can_undo && edit_ok, "Undo", "Ctrl+Z") {
+                acts.push(Act::Undo);
+            }
+            if item(ui, can_redo && edit_ok, "Redo", "Ctrl+Y") {
+                acts.push(Act::Redo);
+            }
+            ui.separator();
+            if item(ui, has_sel, "Copy", "Ctrl+C") {
+                acts.push(Act::Copy);
+            }
+            if item(ui, has, "Select all text on this page", "Ctrl+A") {
+                acts.push(Act::SelectAll);
+            }
+            if item(ui, has, "Find...", "Ctrl+F") {
+                acts.push(Act::Find);
+            }
+            ui.separator();
+            if item(ui, edit_ok, "Add text...", "") {
+                acts.push(Act::ToolAddText);
+            }
+            if item(ui, edit_ok && has_sel, "Highlight the selected text", "Ctrl+H") {
+                acts.push(Act::Highlight);
+            }
+            if item(ui, edit_ok, "Add a note...", "") {
+                acts.push(Act::ToolNote);
+            }
+        });
+        ui.menu_button("Page", |ui| {
+            if item(ui, edit_ok, "Rotate right", "Ctrl+R") {
+                acts.push(Act::Rotate(90, false));
+            }
+            if item(ui, edit_ok, "Rotate left", "") {
+                acts.push(Act::Rotate(-90, false));
+            }
+            if item(ui, edit_ok, "Rotate all pages right", "") {
+                acts.push(Act::Rotate(90, true));
+            }
+            ui.separator();
+            if item(ui, edit_ok && cur > 0, "Move page up", "") {
+                acts.push(Act::MovePage(false));
+            }
+            if item(ui, edit_ok && cur + 1 < n, "Move page down", "") {
+                acts.push(Act::MovePage(true));
+            }
+            if item(ui, edit_ok && n > 1, "Delete page", "") {
+                acts.push(Act::Delete);
+            }
+            ui.separator();
+            if item(ui, edit_ok, "Insert PDF after this page...", "") {
+                acts.push(Act::InsertPdf(false));
+            }
+            if item(ui, edit_ok, "Add PDF at the end...", "") {
+                acts.push(Act::InsertPdf(true));
+            }
+            if item(ui, edit_ok, "Save pages as a new PDF...", "") {
+                acts.push(Act::ExtractDialog);
+            }
+        });
+        ui.menu_button("Signatures", |ui| {
+            if item(ui, has && !self.busy(), "Sign this document...", "") {
+                acts.push(Act::ToolSign);
+            }
+            let label = match self.sigs.len() {
+                0 => "This document is not signed".to_string(),
+                1 => "Show the signature".to_string(),
+                n => format!("Show the {n} signatures"),
+            };
+            if item(ui, !self.sigs.is_empty(), &label, "") {
+                acts.push(Act::ShowSigs);
+            }
+        });
+        ui.menu_button("View", |ui| {
+            if item(ui, has, "Zoom in", "Ctrl++") {
+                acts.push(Act::ZoomStep(true));
+            }
+            if item(ui, has, "Zoom out", "Ctrl+-") {
+                acts.push(Act::ZoomStep(false));
+            }
+            if item(ui, has, "Actual size", "Ctrl+1") {
+                acts.push(Act::Zoom(1.0));
+            }
+            if item(ui, has, "Fit width", "Ctrl+2") {
+                acts.push(Act::Fit(Fit::Width));
+            }
+            if item(ui, has, "Fit page", "Ctrl+0") {
+                acts.push(Act::Fit(Fit::Page));
+            }
+            ui.separator();
+            if item(ui, true, if self.show_thumbs { "Hide the sidebar" } else { "Show the sidebar" }, "") {
+                acts.push(Act::ToggleThumbs);
+            }
+            if item(ui, true, if self.show_panel { "Hide the document panel" } else { "Show the document panel" }, "") {
+                acts.push(Act::TogglePanel);
+            }
+            if item(ui, true, if self.settings.light { "Dark mode" } else { "Light mode" }, "") {
+                acts.push(Act::ToggleTheme);
+            }
+            ui.separator();
+            if item(ui, !self.back.is_empty(), "Back to where the link was", "Alt+Left") {
+                acts.push(Act::Back);
+            }
+        });
+        ui.separator();
+        if register::is_default() {
+            item(ui, false, "ProtoPDF is the default PDF app", "");
+        } else if item(ui, true, "Make ProtoPDF the default PDF app...", "") {
+            acts.push(Act::MakeDefault);
+        }
+        if item(ui, true, "Exit", "") {
+            acts.push(Act::Quit);
+        }
+    }
 
-        egui::Panel::top("menu").show(ui, |ui| {
-            egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    if item(ui, true, "Open...", "Ctrl+O") {
-                        acts.push(Act::Open);
-                    }
-                    if item(ui, has && dirty, "Save", "Ctrl+S") {
-                        acts.push(Act::Save);
-                    }
-                    if item(ui, has, "Save as...", "Ctrl+Shift+S") {
-                        acts.push(Act::SaveAs);
-                    }
-                    ui.separator();
-                    if item(ui, has, "Print...", "Ctrl+P") {
-                        acts.push(Act::Print);
-                    }
-                    ui.separator();
-                    if register::is_default() {
-                        item(ui, false, "ProtoPDF is the default PDF app", "");
-                    } else if item(ui, true, "Make ProtoPDF the default PDF app...", "") {
-                        acts.push(Act::MakeDefault);
-                    }
-                    ui.separator();
-                    if item(ui, true, "Exit", "") {
-                        acts.push(Act::Quit);
-                    }
-                });
-                ui.menu_button("Edit", |ui| {
-                    if item(ui, can_undo && edit_ok, "Undo", "Ctrl+Z") {
-                        acts.push(Act::Undo);
-                    }
-                    if item(ui, can_redo && edit_ok, "Redo", "Ctrl+Y") {
-                        acts.push(Act::Redo);
-                    }
-                    ui.separator();
-                    if item(ui, self.sel.is_some(), "Copy", "Ctrl+C") {
-                        acts.push(Act::Copy);
-                    }
-                    if item(ui, has, "Select all text on this page", "Ctrl+A") {
-                        acts.push(Act::SelectAll);
-                    }
-                    if item(ui, has, "Find...", "Ctrl+F") {
-                        acts.push(Act::Find);
-                    }
-                    ui.separator();
-                    if item(ui, edit_ok, "Add text...", "") {
-                        acts.push(Act::ToolAddText);
-                    }
-                    if item(ui, edit_ok && self.sel.is_some(), "Highlight the selected text", "Ctrl+H") {
-                        acts.push(Act::Highlight);
-                    }
-                    if item(ui, edit_ok, "Add a note...", "") {
-                        acts.push(Act::ToolNote);
-                    }
-                });
-                ui.menu_button("Page", |ui| {
-                    if item(ui, edit_ok, "Rotate right", "Ctrl+R") {
-                        acts.push(Act::Rotate(90, false));
-                    }
-                    if item(ui, edit_ok, "Rotate left", "") {
-                        acts.push(Act::Rotate(-90, false));
-                    }
-                    if item(ui, edit_ok, "Rotate all pages right", "") {
-                        acts.push(Act::Rotate(90, true));
-                    }
-                    ui.separator();
-                    if item(ui, edit_ok && self.cur_page > 0, "Move page up", "") {
-                        acts.push(Act::MovePage(false));
-                    }
-                    if item(ui, edit_ok && self.cur_page + 1 < n, "Move page down", "") {
-                        acts.push(Act::MovePage(true));
-                    }
-                    if item(ui, edit_ok && n > 1, "Delete page", "") {
-                        acts.push(Act::Delete);
-                    }
-                    ui.separator();
-                    if item(ui, edit_ok, "Insert PDF after this page...", "") {
-                        acts.push(Act::InsertPdf(false));
-                    }
-                    if item(ui, edit_ok, "Add PDF at the end...", "") {
-                        acts.push(Act::InsertPdf(true));
-                    }
-                    if item(ui, edit_ok, "Save pages as a new PDF...", "") {
-                        acts.push(Act::ExtractDialog);
-                    }
-                });
-                ui.menu_button("Signatures", |ui| {
-                    if item(ui, has && !self.busy(), "Sign this document...", "") {
-                        acts.push(Act::ToolSign);
-                    }
-                    let label = match self.sigs.len() {
-                        0 => "This document is not signed".to_string(),
-                        1 => "Show the signature".to_string(),
-                        n => format!("Show the {n} signatures"),
-                    };
-                    if item(ui, !self.sigs.is_empty(), &label, "") {
-                        acts.push(Act::ShowSigs);
-                    }
-                });
-                ui.menu_button("View", |ui| {
-                    if item(ui, has, "Zoom in", "Ctrl++") {
-                        acts.push(Act::ZoomStep(true));
-                    }
-                    if item(ui, has, "Zoom out", "Ctrl+-") {
-                        acts.push(Act::ZoomStep(false));
-                    }
-                    if item(ui, has, "Actual size", "Ctrl+1") {
-                        acts.push(Act::Zoom(1.0));
-                    }
-                    if item(ui, has, "Fit width", "Ctrl+2") {
-                        acts.push(Act::Fit(Fit::Width));
-                    }
-                    if item(ui, has, "Fit page", "Ctrl+0") {
-                        acts.push(Act::Fit(Fit::Page));
-                    }
-                    ui.separator();
-                    if item(ui, true, if self.show_thumbs { "Hide the side panel" } else { "Show pages and contents" }, "") {
+    /// File name with its menu, a short status, and the tools as icons.
+    fn top_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>, side_open: bool, panel_open: bool) {
+        let p = self.pal;
+        let has = self.doc.as_ref().is_some_and(|d| d.loaded);
+        let can_undo = self.doc.as_ref().is_some_and(|d| !d.undo.is_empty());
+        let can_redo = self.doc.as_ref().is_some_and(|d| !d.redo.is_empty());
+        let edit_ok = has && !self.busy();
+        let busy = self.busy() || self.print_rx.is_some();
+        let mut msg = String::new();
+        if self.is_dirty() {
+            msg.push_str("Edited");
+        }
+        // While a tool waits for a click its hint is in the notice above the find bar.
+        if !self.status.is_empty() && self.tool == Tool::Select {
+            if !msg.is_empty() {
+                msg.push_str("  ·  ");
+            }
+            msg.push_str(&self.status);
+        }
+        let title = self.doc.as_ref().map(|d| d.name()).unwrap_or_else(|| "ProtoPDF".into());
+        let frame = Frame::NONE.fill(p.bg).inner_margin(Margin { left: 12, right: 10, top: 0, bottom: 0 });
+        egui::Panel::top("top").exact_size(48.0).frame(frame).show(ui, |ui| {
+            ui.horizontal_centered(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if !side_open {
+                    if theme::icon_button(ui, &p, Icon::Sidebar, 32.0, true, false, "Show the sidebar").clicked() {
                         acts.push(Act::ToggleThumbs);
                     }
-                    if item(ui, !self.back.is_empty(), "Back to where the link was", "Alt+Left") {
-                        acts.push(Act::Back);
-                    }
+                    ui.add_space(6.0);
+                }
+                let galley = ui.painter().layout_job(egui::text::LayoutJob {
+                    wrap: egui::text::TextWrapping::truncate_at_width(380.0),
+                    ..egui::text::LayoutJob::simple_singleline(title, theme::medium(15.0), p.text)
                 });
-            });
-        });
-
-        egui::Panel::top("tools").show(ui, |ui| {
-            ui.add_space(3.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                if ui.button("Open").on_hover_text("Open a PDF (Ctrl+O)").clicked() {
-                    acts.push(Act::Open);
+                let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x + 36.0, 32.0), Sense::click());
+                let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&resp));
+                if resp.hovered() || open {
+                    ui.painter().rect_filled(rect, 8.0, p.hover);
                 }
-                if ui.add_enabled(has && dirty, egui::Button::new("Save")).on_hover_text("Save (Ctrl+S)").clicked() {
-                    acts.push(Act::Save);
-                }
-                if printer_button(ui, has).on_hover_text("Print (Ctrl+P)").clicked() {
-                    acts.push(Act::Print);
-                }
-                ui.separator();
-                if ui.selectable_label(self.show_thumbs, "Pages").on_hover_text("Show or hide the page list").clicked() {
-                    acts.push(Act::ToggleThumbs);
-                }
-                ui.separator();
-
-                if ui.add_enabled(has && self.cur_page > 0, egui::Button::new("<")).on_hover_text("Previous page").clicked() {
-                    acts.push(Act::Jump(self.cur_page.saturating_sub(1)));
-                }
-                let field = ui.add_enabled(
-                    has,
-                    egui::TextEdit::singleline(&mut self.page_field).desired_width(34.0).align(Align2::CENTER_CENTER),
-                );
-                if field.lost_focus() {
-                    if let Ok(p) = self.page_field.trim().parse::<usize>() {
-                        if p >= 1 && p - 1 != self.cur_page {
-                            acts.push(Act::Jump(p - 1));
-                        }
-                    }
-                }
-                if !field.has_focus() {
-                    self.page_field = if n > 0 { (self.cur_page + 1).to_string() } else { String::new() };
-                }
-                ui.label(format!("/ {n}"));
-                if ui.add_enabled(has && self.cur_page + 1 < n, egui::Button::new(">")).on_hover_text("Next page").clicked() {
-                    acts.push(Act::Jump(self.cur_page + 1));
-                }
-                ui.separator();
-
-                if ui.add_enabled(has, egui::Button::new("-")).on_hover_text("Zoom out (Ctrl+-)").clicked() {
-                    acts.push(Act::ZoomStep(false));
-                }
-                ui.add_enabled_ui(has, |ui| {
-                    ui.menu_button(format!("{:.0}%", self.zoom * 100.0), |ui| {
-                        for z in ZOOMS {
-                            if ui.button(format!("{:.0}%", z * 100.0)).clicked() {
-                                acts.push(Act::Zoom(z));
-                                ui.close();
-                            }
-                        }
-                    });
-                });
-                if ui.add_enabled(has, egui::Button::new("+")).on_hover_text("Zoom in (Ctrl++)").clicked() {
-                    acts.push(Act::ZoomStep(true));
-                }
-                if ui.add_enabled(has, egui::Button::selectable(self.fit == Fit::Width, "Fit width")).clicked() {
-                    acts.push(Act::Fit(Fit::Width));
-                }
-                if ui.add_enabled(has, egui::Button::selectable(self.fit == Fit::Page, "Fit page")).clicked() {
-                    acts.push(Act::Fit(Fit::Page));
-                }
-                ui.separator();
-
-                if ui.add_enabled(edit_ok, egui::Button::new("Rotate")).on_hover_text("Rotate this page right (Ctrl+R)").clicked() {
-                    acts.push(Act::Rotate(90, false));
-                }
-                if ui
-                    .add_enabled(edit_ok, egui::Button::selectable(self.tool == Tool::AddText, "Add text"))
-                    .on_hover_text("Write text on the page")
-                    .clicked()
-                {
-                    acts.push(Act::ToolAddText);
-                }
-                if ui.add_enabled(can_undo && edit_ok, egui::Button::new("Undo")).on_hover_text("Undo (Ctrl+Z)").clicked() {
-                    acts.push(Act::Undo);
-                }
-                if ui
-                    .add_enabled(edit_ok && self.sel.is_some(), egui::Button::new("Highlight"))
-                    .on_hover_text("Highlight the selected text (Ctrl+H)")
-                    .on_disabled_hover_text("Select text with the mouse first, then press Highlight")
-                    .clicked()
-                {
-                    acts.push(Act::Highlight);
-                }
-                if ui
-                    .add_enabled(edit_ok, egui::Button::selectable(self.tool == Tool::AddNote, "Note"))
-                    .on_hover_text("Stick a note on the page")
-                    .clicked()
-                {
-                    acts.push(Act::ToolNote);
-                }
-                if ui
-                    .add_enabled(has && !self.busy(), egui::Button::selectable(self.tool == Tool::PlaceSig, "Sign"))
-                    .on_hover_text("Sign with your digital signature")
-                    .clicked()
-                {
-                    acts.push(Act::ToolSign);
-                }
-                ui.separator();
-                if ui.add_enabled(has, egui::Button::selectable(self.search.open, "Find")).on_hover_text("Find text (Ctrl+F)").clicked() {
-                    if self.search.open {
-                        self.search.open = false;
-                    } else {
-                        acts.push(Act::Find);
-                    }
-                }
-            });
-            ui.add_space(3.0);
-        });
-
-        if !self.sigs.is_empty() && has {
-            let (level, text) = sign::summary(&self.sigs);
-            let fill = match level {
-                Level::Good => Color32::from_rgb(28, 98, 56),
-                Level::Warn => Color32::from_rgb(138, 96, 10),
-                Level::Bad => Color32::from_rgb(150, 36, 36),
-            };
-            egui::Panel::top("sigbar").frame(egui::Frame::NONE.fill(fill).inner_margin(egui::Margin::symmetric(8, 5))).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.visuals_mut().override_text_color = Some(Color32::WHITE);
-                    if ui.button("Details").clicked() {
-                        acts.push(Act::ShowSigs);
-                    }
-                    ui.add(egui::Label::new(egui::RichText::new(text).color(Color32::WHITE)).truncate());
-                });
-            });
-        }
-
-        if self.search.open && has {
-            egui::Panel::top("find").show(ui, |ui| {
-                ui.add_space(3.0);
-                ui.horizontal(|ui| {
-                    ui.label("Find:");
-                    let r = ui.add(egui::TextEdit::singleline(&mut self.search.query).desired_width(240.0).hint_text("text to find"));
-                    if std::mem::take(&mut self.search.focus) {
-                        r.request_focus();
-                    }
-                    if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                        acts.push(Act::FindNext(!ui.input(|i| i.modifiers.shift)));
-                        r.request_focus();
-                    }
-                    let any = !self.search.hits.is_empty();
-                    if ui.add_enabled(any, egui::Button::new("Previous")).clicked() {
-                        acts.push(Act::FindNext(false));
-                    }
-                    if ui.add_enabled(any, egui::Button::new("Next")).clicked() {
-                        acts.push(Act::FindNext(true));
-                    }
-                    let s = &self.search;
-                    if !s.active.is_empty() {
-                        let pending = n.saturating_sub(s.scanned.len());
-                        let msg = match (s.hits.len(), s.cur, pending) {
-                            (0, _, 0) => "Not found".to_string(),
-                            (0, _, _) => "Searching...".to_string(),
-                            (len, Some(i), 0) => format!("{} of {len}", i + 1),
-                            (len, Some(i), _) => format!("{} of {len}, still searching...", i + 1),
-                            (len, None, _) => format!("{len} found"),
-                        };
-                        ui.label(msg);
-                    }
-                    ui.with_layout(UiLayout::right_to_left(Align::Center), |ui| {
-                        if ui.button("Close").clicked() {
-                            self.search.open = false;
-                        }
-                    });
-                });
-                ui.add_space(3.0);
-            });
-        }
-    }
-
-    fn status_bar(&mut self, ui: &mut egui::Ui) {
-        let dirty = self.is_dirty();
-        egui::Panel::bottom("status").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                if self.busy() || self.print_rx.is_some() {
+                ui.painter().galley(pos2(rect.left() + 8.0, rect.center().y - galley.size().y * 0.5), galley, p.text);
+                theme::paint_icon(ui.painter(), Rect::from_center_size(pos2(rect.right() - 15.0, rect.center().y), vec2(16.0, 16.0)), Icon::ChevronDown, p.muted);
+                let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+                egui::Popup::menu(&resp).show(|ui| self.title_menu(ui, acts));
+                if busy {
+                    ui.add_space(8.0);
                     ui.spinner();
                 }
-                ui.add(egui::Label::new(self.hover.as_deref().unwrap_or(&self.status)).truncate());
+
                 ui.with_layout(UiLayout::right_to_left(Align::Center), |ui| {
-                    if let Some(doc) = &self.doc {
-                        if let Some((w, h)) = doc.sizes.get(self.cur_page) {
-                            ui.label(format!("{:.0} x {:.0} mm", w * 25.4 / 72.0, h * 25.4 / 72.0));
-                            ui.separator();
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    if has {
+                        let tip = if panel_open { "Hide the document panel" } else { "Show the document panel" };
+                        if theme::icon_button(ui, &p, Icon::PanelRight, 32.0, true, panel_open, tip).clicked() {
+                            acts.push(Act::TogglePanel);
                         }
-                        if dirty {
-                            ui.label("Not saved");
+                        theme::vdivider(ui, &p);
+                        if theme::icon_button(ui, &p, Icon::Redo, 32.0, can_redo && edit_ok, false, "Redo (Ctrl+Y)").clicked() {
+                            acts.push(Act::Redo);
                         }
+                        if theme::icon_button(ui, &p, Icon::Undo, 32.0, can_undo && edit_ok, false, "Undo (Ctrl+Z)").clicked() {
+                            acts.push(Act::Undo);
+                        }
+                        if theme::icon_button(ui, &p, Icon::Rotate, 32.0, edit_ok, false, "Rotate this page right (Ctrl+R)").clicked() {
+                            acts.push(Act::Rotate(90, false));
+                        }
+                        theme::vdivider(ui, &p);
+                        let signing = self.tool == Tool::PlaceSig;
+                        if theme::icon_button(ui, &p, Icon::Sign, 32.0, has && !self.busy(), signing, "Sign with your digital signature").clicked() {
+                            acts.push(Act::ToolSign);
+                        }
+                        if theme::icon_button(ui, &p, Icon::Note, 32.0, edit_ok, self.tool == Tool::AddNote, "Stick a note on the page").clicked() {
+                            acts.push(Act::ToolNote);
+                        }
+                        if theme::icon_button(ui, &p, Icon::Text, 32.0, edit_ok, self.tool == Tool::AddText, "Write text on the page").clicked() {
+                            acts.push(Act::ToolAddText);
+                        }
+                        let tip = if self.sel.is_some() {
+                            "Highlight the selected text (Ctrl+H)"
+                        } else {
+                            "Highlight: select text with the mouse first"
+                        };
+                        if theme::icon_button(ui, &p, Icon::Highlighter, 32.0, edit_ok && self.sel.is_some(), false, tip).clicked() {
+                            acts.push(Act::Highlight);
+                        }
+                    }
+                    ui.with_layout(UiLayout::left_to_right(Align::Center), |ui| {
+                        if !msg.is_empty() {
+                            ui.add_space(8.0);
+                            ui.add(egui::Label::new(RichText::new(msg.as_str()).size(13.0).color(p.muted)).truncate());
+                        }
+                    });
+                });
+            });
+        });
+    }
+
+    /// Left: open / find / print, the page list (or contents, or comments), recent files.
+    fn side_panel(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        let p = self.pal;
+        let has = self.doc.as_ref().is_some_and(|d| d.loaded && !d.sizes.is_empty());
+        let cur_path = self.doc.as_ref().and_then(|d| d.path.as_ref()).and_then(|p| std::path::absolute(p).ok());
+        let recent = self.recent_files(if has { 4 } else { 8 });
+        let can_back = !self.back.is_empty();
+        let frame = Frame::NONE.fill(p.side).inner_margin(Margin { left: 8, right: 8, top: 6, bottom: 6 });
+        egui::Panel::left("side").resizable(false).exact_size(SIDEBAR_W).frame(frame).show(ui, |ui| {
+            ui.spacing_mut().item_spacing.y = 2.0;
+            ui.horizontal(|ui| {
+                ui.set_height(40.0);
+                ui.spacing_mut().item_spacing.x = 2.0;
+                if theme::icon_button(ui, &p, Icon::Sidebar, 32.0, true, false, "Hide the sidebar").clicked() {
+                    acts.push(Act::ToggleThumbs);
+                }
+                if theme::icon_button(ui, &p, Icon::ChevronLeft, 32.0, can_back, false, "Back to where the link was (Alt+Left)").clicked() {
+                    acts.push(Act::Back);
+                }
+            });
+            ui.add_space(6.0);
+            if theme::nav_row(ui, &p, Icon::Folder, "Open file", "Ctrl O", true).clicked() {
+                acts.push(Act::Open);
+            }
+            if theme::nav_row(ui, &p, Icon::Search, "Find in document", "Ctrl F", has).clicked() {
+                acts.push(Act::Find);
+            }
+            if theme::nav_row(ui, &p, Icon::Printer, "Print", "Ctrl P", has).clicked() {
+                acts.push(Act::Print);
+            }
+
+            let footer_h = 46.0;
+            let recent_h = if recent.is_empty() { 0.0 } else { 40.0 + recent.len() as f32 * 36.0 };
+            if has {
+                ui.add_space(16.0);
+                let tab = self.side_tabs(ui);
+                ui.add_space(10.0);
+                let h = (ui.available_height() - recent_h - footer_h - 6.0).max(90.0);
+                let w = ui.available_width();
+                ui.allocate_ui(vec2(w, h), |ui| {
+                    ui.set_min_size(vec2(w, h));
+                    match tab {
+                        SideTab::Pages => self.thumb_grid(ui, acts),
+                        SideTab::Contents => self.outline_list(ui, acts),
+                        SideTab::Comments => {
+                            ScrollArea::vertical().auto_shrink(false).id_salt("comments").show(ui, |ui| {
+                                ui.add_space(2.0);
+                                self.comment_list(ui, acts, usize::MAX);
+                            });
+                        }
+                    }
+                });
+            }
+            if !recent.is_empty() {
+                ui.add_space(14.0);
+                ui.horizontal(|ui| {
+                    ui.add_space(10.0);
+                    ui.label(RichText::new("Recent").size(13.0).color(p.muted));
+                });
+                ui.add_space(4.0);
+                for r in &recent {
+                    let name = r.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                    let here = cur_path.as_ref() == Some(r);
+                    let resp = theme::list_row(ui, &p, &name, here).on_hover_text(r.display().to_string());
+                    if resp.clicked() && !here {
+                        acts.push(Act::OpenPath(r.clone()));
+                    }
+                }
+            }
+
+            let rest = ui.available_height() - footer_h;
+            if rest > 0.0 {
+                ui.add_space(rest);
+            }
+            let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+            ui.painter().rect_filled(line, 0.0, p.border);
+            ui.horizontal(|ui| {
+                ui.set_height(44.0);
+                ui.add_space(8.0);
+                let (r, _) = ui.allocate_exact_size(vec2(22.0, 22.0), Sense::hover());
+                ui.painter().rect_filled(r, 6.0, p.accent);
+                theme::paint_icon(ui.painter(), r.shrink(4.0), Icon::File, Color32::WHITE);
+                ui.add_space(4.0);
+                ui.label(RichText::new("ProtoPDF").font(theme::medium(14.0)).color(p.text));
+                ui.label(RichText::new(env!("CARGO_PKG_VERSION")).size(13.0).color(p.muted));
+                ui.with_layout(UiLayout::right_to_left(Align::Center), |ui| {
+                    let (ic, tip) = if p.dark { (Icon::Sun, "Switch to light mode") } else { (Icon::Moon, "Switch to dark mode") };
+                    if theme::icon_button(ui, &p, ic, 32.0, true, false, tip).clicked() {
+                        acts.push(Act::ToggleTheme);
                     }
                 });
             });
         });
     }
 
-    fn thumbs_panel(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        let here = self.position().unwrap_or((self.cur_page, 0.0));
+    /// Pages / Contents / Comments. Returns the tab to show (one that has something in it).
+    fn side_tabs(&mut self, ui: &mut egui::Ui) -> SideTab {
+        let p = self.pal;
+        let info = self.info.clone();
+        let has_outline = info.as_ref().is_some_and(|i| !i.outline.is_empty());
+        let comments: usize = info.as_ref().map_or(0, |i| i.pages.iter().map(|p| p.notes.len()).sum());
+        let mut tabs = vec![(SideTab::Pages, "Pages".to_string())];
+        if has_outline {
+            tabs.push((SideTab::Contents, "Contents".to_string()));
+        }
+        if comments > 0 {
+            tabs.push((SideTab::Comments, format!("Comments {comments}")));
+        }
+        let shown = if tabs.iter().any(|t| t.0 == self.side_tab) { self.side_tab } else { SideTab::Pages };
+        let top = ui.cursor().top();
+        ui.horizontal(|ui| {
+            ui.add_space(10.0);
+            ui.spacing_mut().item_spacing.x = 18.0;
+            for (tab, label) in tabs {
+                let on = tab == shown;
+                let (font, color) = if on { (theme::medium(13.0), p.text) } else { (FontId::proportional(13.0), p.muted) };
+                let galley = ui.painter().layout_no_wrap(label, font, color);
+                let (rect, resp) = ui.allocate_exact_size(vec2(galley.size().x, 32.0), Sense::click());
+                ui.painter().galley(pos2(rect.left(), rect.center().y - galley.size().y * 0.5), galley, color);
+                if on {
+                    ui.painter().rect_filled(Rect::from_min_max(pos2(rect.left(), rect.bottom() - 2.0), rect.right_bottom()), 1.0, p.accent);
+                }
+                if resp.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                    self.side_tab = tab;
+                }
+            }
+        });
+        let r = ui.min_rect();
+        let y = (top + 32.0).max(r.top());
+        ui.painter().rect_filled(Rect::from_min_max(pos2(r.left(), y), pos2(r.right(), y + 1.0)), 0.0, p.border);
+        shown
+    }
+
+    /// Page thumbnails, two to a row.
+    fn thumb_grid(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        let p = self.pal;
         let Some(doc) = self.doc.as_mut() else { return };
         let cur = self.cur_page;
         let jobs = &mut self.jobs_thumb;
-        let item_h = |s: &(f32, f32)| THUMB_W * (s.1 / s.0.max(1.0)).clamp(0.2, 3.0) + 26.0;
+        let sizes = &doc.sizes;
+        let thumbs = &doc.thumbs;
+        let loaded = doc.loaded;
+        let width = ui.available_width() - 6.0;
+        let gap = 10.0;
+        let cell = ((width - gap) * 0.5).floor();
+        let tw = (cell - 16.0).clamp(40.0, 100.0);
+        let th = |s: &(f32, f32)| (tw * (s.1 / s.0.max(1.0)).clamp(0.2, 3.0)).round();
+        let rows = sizes.len().div_ceil(2);
+        let row_h = |r: usize| {
+            let b = sizes.get(2 * r + 1).map(th).unwrap_or(0.0);
+            th(&sizes[2 * r]).max(b) + 36.0
+        };
 
         // Keep the current page in sight when it changes.
-        if self.thumb_follow != cur && doc.loaded {
+        if self.thumb_follow != cur && loaded && rows > 0 {
             self.thumb_follow = cur;
-            let top: f32 = doc.sizes[..cur.min(doc.sizes.len())].iter().map(item_h).sum();
-            let h = doc.sizes.get(cur).map(item_h).unwrap_or(0.0);
+            let r = (cur / 2).min(rows - 1);
+            let top: f32 = (0..r).map(row_h).sum();
             let (v_top, v_h) = self.thumb_view;
-            if top < v_top || top + h > v_top + v_h {
+            if top < v_top || top + row_h(r) > v_top + v_h {
                 self.thumb_scroll = Some((top - 30.0).max(0.0));
             }
         }
 
-        let info = self.info.clone();
-        let has_outline = info.as_ref().is_some_and(|i| !i.outline.is_empty());
-        let tab = if has_outline { self.side_tab } else { SideTab::Pages };
-        let width = if tab == SideTab::Contents { 270.0 } else { THUMB_PANEL };
-        egui::Panel::left("thumbs").resizable(false).exact_size(width).show(ui, |ui| {
-            if has_outline {
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.side_tab, SideTab::Pages, "Pages");
-                    ui.selectable_value(&mut self.side_tab, SideTab::Contents, "Contents");
-                });
-                ui.separator();
-            }
-            if tab == SideTab::Contents {
-                let Some(info) = &info else { return };
-                // The entry being read: the last one that starts at or above the top of the view.
-                let current = info.outline.iter().rposition(|o| o.page.is_some_and(|p| p < here.0 || (p == here.0 && o.y <= here.1 + 60.0)));
-                ScrollArea::vertical().auto_shrink(false).id_salt("outline").show(ui, |ui| {
-                    for (k, item) in info.outline.iter().enumerate() {
-                        ui.horizontal(|ui| {
-                            ui.add_space(item.level.min(8) as f32 * 12.0);
-                            let entry = egui::Button::selectable(current == Some(k), item.title.as_str()).truncate();
-                            if ui.add_enabled(item.page.is_some(), entry).clicked() {
-                                if let Some(page) = item.page {
-                                    acts.push(Act::Goto(page, item.y));
-                                }
-                            }
-                        });
-                    }
-                });
-                return;
-            }
-            let mut area = ScrollArea::vertical().auto_shrink(false).id_salt("thumbs");
-            if let Some(y) = self.thumb_scroll.take() {
-                area = area.vertical_scroll_offset(y);
-            }
-            let out = area.show_viewport(ui, |ui, viewport| {
-                let total: f32 = doc.sizes.iter().map(item_h).sum();
-                let width = ui.available_width();
-                let (rect, _) = ui.allocate_exact_size(vec2(width, total.max(viewport.height())), Sense::hover());
-                let painter = ui.painter();
-                let accent = ui.visuals().selection.bg_fill;
-                let text_color = ui.visuals().text_color();
-                let mut y = 0.0;
-                for (i, s) in doc.sizes.iter().enumerate() {
-                    let h = item_h(s);
-                    if y + h >= viewport.top() && y <= viewport.bottom() {
-                        let th = h - 26.0;
-                        let r = Rect::from_min_size(
-                            pos2(rect.left() + (width - THUMB_W) * 0.5, rect.top() + y + 6.0),
-                            vec2(THUMB_W, th),
-                        );
-                        let resp = ui.interact(r.expand(4.0), ui.scope_id().with(("thumb", i)), Sense::click());
+        let mut area = ScrollArea::vertical().auto_shrink(false).id_salt("thumbs");
+        if let Some(y) = self.thumb_scroll.take() {
+            area = area.vertical_scroll_offset(y);
+        }
+        let uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+        let out = area.show_viewport(ui, |ui, viewport| {
+            let total: f32 = (0..rows).map(row_h).sum();
+            let (rect, _) = ui.allocate_exact_size(vec2(width, total.max(viewport.height())), Sense::hover());
+            let painter = ui.painter();
+            let mut y = 0.0;
+            for r in 0..rows {
+                let h = row_h(r);
+                if y + h >= viewport.top() && y <= viewport.bottom() {
+                    for c in 0..2 {
+                        let i = 2 * r + c;
+                        let Some(s) = sizes.get(i) else { break };
+                        let x0 = rect.left() + c as f32 * (cell + gap);
+                        let tr = Rect::from_min_size(pos2((x0 + (cell - tw) * 0.5).round(), rect.top() + y + 6.0), vec2(tw, th(s)));
+                        let resp = ui.interact(tr.expand(5.0), ui.scope_id().with(("thumb", i)), Sense::click());
                         if resp.clicked() {
                             acts.push(Act::Jump(i));
                         }
-                        if i == cur || resp.hovered() {
-                            let a = if i == cur { accent } else { accent.gamma_multiply(0.45) };
-                            painter.rect_filled(r.expand(4.0), 3.0, a);
+                        if i == cur {
+                            painter.rect_stroke(tr.expand(5.0), 7.0, Stroke::new(2.0, p.accent), StrokeKind::Inside);
+                        } else if resp.hovered() {
+                            painter.rect_stroke(tr.expand(5.0), 7.0, Stroke::new(1.0, p.faint), StrokeKind::Inside);
                         }
-                        painter.rect_filled(r, 0.0, Color32::WHITE);
-                        match doc.thumbs.get(&i) {
+                        painter.rect_filled(tr, 2.0, Color32::WHITE);
+                        match thumbs.get(&i) {
                             Some(tex) => {
-                                painter.image(tex.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
+                                painter.image(tex.id(), tr, uv, Color32::WHITE);
                             }
-                            None if doc.loaded => jobs.push(Job { page: i, kind: Kind::Render(THUMB_PX) }),
+                            None if loaded => jobs.push(Job { page: i, kind: Kind::Render(THUMB_PX) }),
                             None => {}
                         }
-                        painter.rect_stroke(r, 0.0, Stroke::new(1.0, Color32::from_gray(150)), StrokeKind::Outside);
-                        painter.text(
-                            pos2(r.center().x, r.bottom() + 3.0),
-                            Align2::CENTER_TOP,
-                            (i + 1).to_string(),
-                            FontId::proportional(11.0),
-                            text_color,
-                        );
+                        painter.rect_stroke(tr, 2.0, Stroke::new(1.0, Color32::from_black_alpha(40)), StrokeKind::Outside);
+                        let (font, color) = if i == cur { (theme::medium(12.0), p.text) } else { (FontId::proportional(12.0), p.muted) };
+                        painter.text(pos2(tr.center().x, tr.bottom() + 9.0), Align2::CENTER_TOP, (i + 1).to_string(), font, color);
                     }
-                    y += h;
                 }
-            });
-            self.thumb_view = (out.state.clamped_offset().y, out.inner_rect.height());
+                y += h;
+            }
+        });
+        self.thumb_view = (out.state.clamped_offset().y, out.inner_rect.height());
+    }
+
+    /// The document's bookmarks, with the one being read marked.
+    fn outline_list(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        let Some(info) = self.info.clone() else { return };
+        let here = self.position().unwrap_or((self.cur_page, 0.0));
+        // The entry being read: the last one that starts at or above the top of the view.
+        let current = info.outline.iter().rposition(|o| o.page.is_some_and(|p| p < here.0 || (p == here.0 && o.y <= here.1 + 60.0)));
+        ScrollArea::vertical().auto_shrink(false).id_salt("outline").show(ui, |ui| {
+            for (k, item) in info.outline.iter().enumerate() {
+                ui.horizontal(|ui| {
+                    ui.add_space(4.0 + item.level.min(8) as f32 * 12.0);
+                    let entry = egui::Button::selectable(current == Some(k), item.title.as_str()).truncate();
+                    if ui.add_enabled(item.page.is_some(), entry).clicked() {
+                        if let Some(page) = item.page {
+                            acts.push(Act::Goto(page, item.y));
+                        }
+                    }
+                });
+            }
         });
     }
 
-    fn welcome(ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+    /// Highlights and notes, in page order. Clicking one goes to it.
+    fn comment_list(&self, ui: &mut egui::Ui, acts: &mut Vec<Act>, limit: usize) {
+        let p = self.pal;
+        let Some(info) = self.info.clone() else { return };
+        let mut shown = 0;
+        for (page, pi) in info.pages.iter().enumerate() {
+            for (k, note) in pi.notes.iter().enumerate() {
+                if shown == limit {
+                    return;
+                }
+                shown += 1;
+                let kind = if note.highlight { "Highlight" } else { "Note" };
+                let mut head = format!("{kind} · page {}", page + 1);
+                if !note.author.trim().is_empty() {
+                    head.push_str(" · ");
+                    head.push_str(note.author.trim());
+                }
+                let body: String = note.text.trim().chars().take(160).collect();
+                let resp = ui
+                    .horizontal_top(|ui| {
+                        ui.add_space(2.0);
+                        let (sw, _) = ui.allocate_exact_size(vec2(10.0, 18.0), Sense::hover());
+                        let sq = Rect::from_center_size(pos2(sw.center().x, sw.top() + 9.0), vec2(10.0, 10.0));
+                        if note.highlight {
+                            ui.painter().rect_filled(sq, 3.0, Color32::from_rgb(250, 204, 21));
+                        } else {
+                            ui.painter().rect(sq, 3.0, Color32::from_rgb(242, 201, 76), Stroke::new(1.0, Color32::from_rgb(184, 144, 26)), StrokeKind::Inside);
+                        }
+                        ui.add_space(4.0);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.label(RichText::new(head).size(12.0).color(p.muted));
+                            if body.is_empty() {
+                                ui.label(RichText::new(if note.highlight { "Highlighted text" } else { "Empty note" }).size(13.5).color(p.muted).italics());
+                            } else {
+                                ui.add(egui::Label::new(RichText::new(body).size(13.5).color(p.text2)).wrap());
+                            }
+                        });
+                    })
+                    .response;
+                let click = ui.interact(resp.rect, ui.scope_id().with(("comment", page, k)), Sense::click());
+                if click.on_hover_cursor(CursorIcon::PointingHand).clicked() {
+                    acts.push(Act::Goto(page, (note.rect[1] - 40.0).max(0.0)));
+                }
+                ui.add_space(8.0);
+            }
+        }
+    }
+
+    /// Right: what the document is, who signed it, its comments and unsaved changes.
+    fn info_panel(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        let p = self.pal;
+        let frame = Frame::NONE.fill(p.bg).inner_margin(Margin { left: 20, right: 14, top: 18, bottom: 14 });
+        egui::Panel::right("info").resizable(false).exact_size(PANEL_W).frame(frame).show(ui, |ui| {
+            ScrollArea::vertical().auto_shrink(false).id_salt("info").show(ui, |ui| {
+                ui.set_width(ui.available_width() - 6.0);
+                ui.spacing_mut().item_spacing.y = 4.0;
+                self.info_document(ui);
+                theme::divider(ui, &p);
+                self.info_signatures(ui, acts);
+                theme::divider(ui, &p);
+                self.info_comments(ui, acts);
+                theme::divider(ui, &p);
+                self.info_changes(ui, acts);
+            });
+        });
+    }
+
+    fn info_document(&self, ui: &mut egui::Ui) {
+        let p = self.pal;
+        let Some(doc) = &self.doc else { return };
+        theme::section(ui, &p, "Document", None);
+        ui.add_space(2.0);
+        let row = |ui: &mut egui::Ui, ic: Icon, text: String| {
+            ui.horizontal(|ui| {
+                ui.set_height(30.0);
+                theme::icon(ui, ic, 18.0, p.muted);
+                ui.add_space(4.0);
+                ui.add(egui::Label::new(RichText::new(text).size(14.0).color(p.text2)).truncate());
+            });
+        };
+        let n = doc.sizes.len();
+        let (w, h) = doc.sizes.get(self.cur_page).copied().unwrap_or((0.0, 0.0));
+        let pages = format!("{n} {}", if n == 1 { "page" } else { "pages" });
+        row(ui, Icon::File, match paper_name(w, h) {
+            Some(name) => format!("{pages} · {name}"),
+            None => pages,
+        });
+        row(ui, Icon::Ruler, format!("{:.0} × {:.0} mm", w * 25.4 / 72.0, h * 25.4 / 72.0));
+        let lock = if doc.password.is_empty() { "No password" } else { "Password protected" };
+        row(ui, Icon::Lock, format!("{lock} · {}", human_size(doc.bytes.len())));
+    }
+
+    fn info_signatures(&self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        let p = self.pal;
+        let has = self.doc.as_ref().is_some_and(|d| d.loaded);
+        let sigs = &self.sigs;
+        let note = if self.sig_rx.is_some() {
+            Some((Icon::Shield, "Checking...".to_string(), p.muted))
+        } else if sigs.is_empty() {
+            None
+        } else {
+            Some(match sign::summary(sigs).0 {
+                Level::Good => (Icon::Check, format!("{} valid", sigs.len()), p.good),
+                Level::Warn => (Icon::Warn, "Not confirmed".to_string(), p.warn),
+                Level::Bad => (Icon::Warn, "Not valid".to_string(), p.bad),
+            })
+        };
+        theme::section(ui, &p, "Signatures", note.as_ref().map(|(i, t, c)| (*i, t.as_str(), *c)));
+        ui.add_space(6.0);
+        if sigs.is_empty() && self.sig_rx.is_none() {
+            ui.label(RichText::new("This document is not signed.").size(13.0).color(p.muted));
+            ui.add_space(4.0);
+        }
+        for (k, s) in sigs.iter().enumerate().take(3) {
+            let title = if s.is_timestamp {
+                "Document timestamp".to_string()
+            } else if s.org.is_empty() || s.org == s.signer {
+                s.signer.clone()
+            } else {
+                format!("{} ({})", s.signer, s.org)
+            };
+            let when = match &s.timestamp {
+                Some(t) => format!("{t} · timestamped"),
+                None => s.signed_at.clone(),
+            };
+            let card = Frame::new()
+                .fill(p.card)
+                .stroke(Stroke::new(1.0, p.border))
+                .corner_radius(12)
+                .inner_margin(Margin::same(12))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal_top(|ui| {
+                        theme::avatar(ui, &p, if s.is_timestamp { "T S" } else { s.signer.as_str() });
+                        ui.add_space(4.0);
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 2.0;
+                            ui.add(egui::Label::new(RichText::new(title).font(theme::medium(14.0)).color(p.text)).truncate());
+                            if !when.is_empty() {
+                                ui.add(egui::Label::new(RichText::new(when).size(12.0).color(p.muted)).truncate());
+                            }
+                            ui.add_space(6.0);
+                            ui.horizontal_wrapped(|ui| {
+                                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
+                                if s.intact {
+                                    theme::chip(ui, Icon::Check, "Unchanged", p.good, p.good_bg);
+                                } else {
+                                    theme::chip(ui, Icon::Warn, "Changed", p.bad, p.bad_bg);
+                                }
+                                if s.trusted {
+                                    theme::chip(ui, Icon::Check, "Trusted", p.good, p.good_bg);
+                                } else {
+                                    theme::chip(ui, Icon::Warn, "Not confirmed", p.warn, p.warn_bg);
+                                }
+                            });
+                        });
+                    });
+                })
+                .response;
+            let click = ui.interact(card.rect, ui.scope_id().with(("sig", k)), Sense::click());
+            if click.on_hover_cursor(CursorIcon::PointingHand).on_hover_text("Show the details").clicked() {
+                acts.push(Act::ShowSigs);
+            }
+            ui.add_space(6.0);
+        }
+        if sigs.len() > 3 {
+            if ui.link(format!("{} more", sigs.len() - 3)).clicked() {
+                acts.push(Act::ShowSigs);
+            }
+        }
+        let placing = self.tool == Tool::PlaceSig;
+        let label = if placing { "Click the page to place it" } else { "Add my signature" };
+        if theme::wide_button(ui, &p, Icon::Sign, p.accent, label, has && !self.busy(), placing).clicked() {
+            acts.push(Act::ToolSign);
+        }
+    }
+
+    fn info_comments(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        let p = self.pal;
+        let count: usize = self.info.as_ref().map_or(0, |i| i.pages.iter().map(|p| p.notes.len()).sum());
+        let n = count.to_string();
+        theme::section(ui, &p, "Comments", (count > 0).then_some((Icon::Note, n.as_str(), p.muted)));
+        ui.add_space(6.0);
+        if count == 0 {
+            ui.add(egui::Label::new(RichText::new("None yet. Select text and highlight it, or stick a note on the page.").size(13.0).color(p.muted)).wrap());
+            return;
+        }
+        self.comment_list(ui, acts, 4);
+        if count > 4 && ui.link(format!("Show all {count}")).clicked() {
+            self.show_thumbs = true;
+            self.side_tab = SideTab::Comments;
+        }
+    }
+
+    fn info_changes(&self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        let p = self.pal;
+        let dirty = self.is_dirty();
+        theme::section(ui, &p, "Changes", None);
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.set_height(34.0);
+            theme::icon(ui, Icon::Diff, 18.0, p.muted);
+            ui.add_space(4.0);
+            if dirty {
+                match self.unsaved_count() {
+                    Some(k) if k > 0 => {
+                        ui.label(RichText::new(format!("+{k}")).font(theme::mono(13.0)).color(p.good));
+                        ui.label(RichText::new("not saved").size(13.0).color(p.muted));
+                    }
+                    _ => {
+                        ui.label(RichText::new("Not saved").size(13.0).color(p.muted));
+                    }
+                }
+            } else {
+                ui.label(RichText::new("All saved").size(13.0).color(p.muted));
+            }
+            ui.with_layout(UiLayout::right_to_left(Align::Center), |ui| {
+                if theme::primary_button(ui, &p, "Save changes", dirty && !self.busy()).clicked() {
+                    acts.push(Act::Save);
+                }
+            });
+        });
+    }
+
+    /// Floating over the bottom of the page view: a notice (signature check or what
+    /// the current tool wants) and the find bar with page and zoom controls.
+    fn overlay(&mut self, ctx: &egui::Context, area: Rect, acts: &mut Vec<Act>) {
+        let p = self.pal;
+        if !self.doc.as_ref().is_some_and(|d| d.loaded) {
+            return;
+        }
+        if let Some(h) = self.hover.clone() {
+            egui::Area::new(egui::Id::unique("hover_link"))
+                .interactable(false)
+                .fixed_pos(area.left_top() + vec2(12.0, 12.0))
+                .show(ctx, |ui| {
+                    Frame::new().fill(p.raised).stroke(Stroke::new(1.0, p.border)).corner_radius(8).inner_margin(Margin::symmetric(10, 5)).show(ui, |ui| {
+                        ui.label(RichText::new(h).size(12.5).color(p.text2));
+                    });
+                });
+        }
+        let width = (area.width() - 32.0).clamp(280.0, 700.0);
+        egui::Area::new(egui::Id::unique("find_bar"))
+            .pivot(Align2::CENTER_BOTTOM)
+            .fixed_pos(pos2(area.center().x, area.bottom() - 16.0))
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                ui.spacing_mut().item_spacing.y = 8.0;
+                self.notice(ui, acts, width);
+                self.find_bar(ui, acts, width);
+            });
+    }
+
+    fn notice(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>, width: f32) {
+        let p = self.pal;
+        let tool_hint = match self.tool {
+            Tool::AddText if self.draft.is_none() => Some("Click on the page where the text should start"),
+            Tool::AddNote if self.note_draft.is_none() => Some("Click on the page where the note should go"),
+            Tool::PlaceSig if self.sign_draft.is_none() => Some("Click on the page where the signature should appear"),
+            _ => None,
+        };
+        let mut job = egui::text::LayoutJob::default();
+        let fmt = |color: Color32| egui::TextFormat { font_id: FontId::proportional(14.0), color, ..Default::default() };
+        let (ic, color, button, closable) = if let Some(hint) = tool_hint {
+            job.append(hint, 0.0, fmt(p.text));
+            let ic = match self.tool {
+                Tool::AddText => Icon::Text,
+                Tool::AddNote => Icon::Note,
+                _ => Icon::Sign,
+            };
+            (ic, p.accent, "Cancel", false)
+        } else if !self.sigs.is_empty() && !self.sig_hidden && self.sig_rx.is_none() {
+            let (level, text) = sign::summary(&self.sigs);
+            let (head, rest) = match text.find(". ") {
+                Some(k) => (&text[..k + 1], &text[k + 1..]),
+                None => (text.as_str(), ""),
+            };
+            job.append(head, 0.0, fmt(p.text));
+            job.append(rest, 0.0, fmt(p.muted));
+            let (ic, color) = match level {
+                Level::Good => (Icon::Shield, p.good),
+                Level::Warn => (Icon::Warn, p.warn),
+                Level::Bad => (Icon::Warn, p.bad),
+            };
+            (ic, color, "Details", true)
+        } else {
+            return;
+        };
+        job.wrap = egui::text::TextWrapping::truncate_at_width(f32::INFINITY);
+        Frame::new()
+            .fill(if p.dark { p.side } else { p.raised })
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(14)
+            .inner_margin(Margin { left: 14, right: 8, top: 7, bottom: 7 })
+            .show(ui, |ui| {
+                ui.set_width(width - 24.0);
+                ui.horizontal(|ui| {
+                    theme::icon(ui, ic, 18.0, color);
+                    ui.add_space(4.0);
+                    ui.with_layout(UiLayout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        if closable && theme::icon_button(ui, &p, Icon::Close, 30.0, true, false, "Hide").clicked() {
+                            self.sig_hidden = true;
+                        }
+                        let b = egui::Button::new(RichText::new(button).size(13.0).color(p.text)).fill(p.active).stroke(Stroke::NONE).corner_radius(8).min_size(vec2(0.0, 30.0));
+                        if ui.add(b).clicked() {
+                            if closable {
+                                acts.push(Act::ShowSigs);
+                            } else {
+                                self.tool = Tool::Select;
+                                self.status.clear();
+                            }
+                        }
+                        ui.with_layout(UiLayout::left_to_right(Align::Center), |ui| {
+                            ui.add(egui::Label::new(job).truncate());
+                        });
+                    });
+                });
+            });
+    }
+
+    fn find_bar(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>, width: f32) {
+        let p = self.pal;
+        let n = self.doc.as_ref().map_or(0, |d| d.sizes.len());
+        let find_id = egui::Id::unique("find_text");
+        let focused = ui.memory(|m| m.has_focus(find_id));
+        Frame::new()
+            .fill(p.raised)
+            .stroke(Stroke::new(1.0, p.border))
+            .corner_radius(16)
+            .inner_margin(Margin { left: 14, right: 8, top: 7, bottom: 7 })
+            .shadow(Shadow { offset: [0, 10], blur: 28, spread: 0, color: p.shadow })
+            .show(ui, |ui| {
+                ui.set_width(width - 24.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 2.0;
+                    theme::icon(ui, Icon::Search, 18.0, p.muted);
+                    ui.add_space(6.0);
+                    ui.with_layout(UiLayout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        if theme::icon_button(ui, &p, Icon::FitPage, 32.0, true, self.fit == Fit::Page, "Fit page (Ctrl+0)").clicked() {
+                            acts.push(Act::Fit(Fit::Page));
+                        }
+                        if theme::icon_button(ui, &p, Icon::FitWidth, 32.0, true, self.fit == Fit::Width, "Fit width (Ctrl+2)").clicked() {
+                            acts.push(Act::Fit(Fit::Width));
+                        }
+                        theme::vdivider(ui, &p);
+                        if theme::icon_button(ui, &p, Icon::Plus, 30.0, true, false, "Zoom in (Ctrl++)").clicked() {
+                            acts.push(Act::ZoomStep(true));
+                        }
+                        ui.menu_button(RichText::new(format!("{:.0}%", self.zoom * 100.0)).font(theme::mono(13.0)).color(p.text), |ui| {
+                            for z in ZOOMS {
+                                if ui.button(format!("{:.0}%", z * 100.0)).clicked() {
+                                    acts.push(Act::Zoom(z));
+                                    ui.close();
+                                }
+                            }
+                        });
+                        if theme::icon_button(ui, &p, Icon::Minus, 30.0, true, false, "Zoom out (Ctrl+-)").clicked() {
+                            acts.push(Act::ZoomStep(false));
+                        }
+                        theme::vdivider(ui, &p);
+                        if theme::icon_button(ui, &p, Icon::ChevronRight, 30.0, self.cur_page + 1 < n, false, "Next page").clicked() {
+                            acts.push(Act::Jump(self.cur_page + 1));
+                        }
+                        ui.label(RichText::new(format!("/ {n}")).font(theme::mono(13.0)).color(p.muted));
+                        let field = ui.add(
+                            egui::TextEdit::singleline(&mut self.page_field)
+                                .desired_width(30.0)
+                                .align(Align2::CENTER_CENTER)
+                                .font(theme::mono(13.0))
+                                .margin(Margin::symmetric(4, 3)),
+                        );
+                        if field.lost_focus() {
+                            if let Ok(pg) = self.page_field.trim().parse::<usize>() {
+                                if pg >= 1 && pg - 1 != self.cur_page {
+                                    acts.push(Act::Jump(pg - 1));
+                                }
+                            }
+                        }
+                        if !field.has_focus() {
+                            self.page_field = if n > 0 { (self.cur_page + 1).to_string() } else { String::new() };
+                        }
+                        if theme::icon_button(ui, &p, Icon::ChevronLeft, 30.0, self.cur_page > 0, false, "Previous page").clicked() {
+                            acts.push(Act::Jump(self.cur_page.saturating_sub(1)));
+                        }
+                        theme::vdivider(ui, &p);
+
+                        let s = &self.search;
+                        if !s.query.trim().is_empty() {
+                            let any = !s.hits.is_empty();
+                            if theme::icon_button(ui, &p, Icon::ChevronDown, 28.0, any, false, "Next match (Enter, F3)").clicked() {
+                                acts.push(Act::FindNext(true));
+                            }
+                            if theme::icon_button(ui, &p, Icon::ChevronUp, 28.0, any, false, "Previous match (Shift+Enter)").clicked() {
+                                acts.push(Act::FindNext(false));
+                            }
+                            if !s.active.is_empty() {
+                                let pending = n.saturating_sub(s.scanned.len());
+                                let msg = match (s.hits.len(), s.cur, pending) {
+                                    (0, _, 0) => "Not found".to_string(),
+                                    (0, _, _) => "Searching...".to_string(),
+                                    (len, Some(i), _) => format!("{} of {len}", i + 1),
+                                    (len, None, _) => format!("{len} found"),
+                                };
+                                ui.label(RichText::new(msg).size(12.5).color(p.muted));
+                                ui.add_space(4.0);
+                            }
+                        } else if !focused {
+                            Frame::new().stroke(Stroke::new(1.0, p.border)).corner_radius(5).inner_margin(Margin::symmetric(6, 2)).show(ui, |ui| {
+                                ui.label(RichText::new("Ctrl F").font(theme::mono(11.0)).color(p.muted));
+                            });
+                            ui.add_space(4.0);
+                        }
+
+                        ui.with_layout(UiLayout::left_to_right(Align::Center), |ui| {
+                            let r = ui.add(
+                                egui::TextEdit::singleline(&mut self.search.query)
+                                    .id(find_id)
+                                    .frame(Frame::NONE)
+                                    .background_color(Color32::TRANSPARENT)
+                                    .hint_text("Find in document…")
+                                    .font(FontId::proportional(14.0))
+                                    .desired_width(ui.available_width()),
+                            );
+                            if std::mem::take(&mut self.search.focus) {
+                                r.request_focus();
+                            }
+                            if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
+                                acts.push(Act::FindNext(!ui.input(|i| i.modifiers.shift)));
+                                r.request_focus();
+                            }
+                        });
+                    });
+                });
+            });
+    }
+
+    /// Shown when no document is open.
+    fn welcome(&self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
+        let p = self.pal;
+        let recent = self.recent_files(5);
         ui.vertical_centered(|ui| {
-            ui.add_space(ui.available_height() * 0.35);
-            ui.heading("ProtoPDF");
-            ui.add_space(10.0);
-            if ui.add(egui::Button::new("Open a PDF").min_size(vec2(160.0, 36.0))).clicked() {
+            ui.add_space((ui.available_height() * 0.5 - 170.0 - recent.len() as f32 * 18.0).max(24.0));
+            let (r, _) = ui.allocate_exact_size(vec2(56.0, 56.0), Sense::hover());
+            ui.painter().rect_filled(r, 14.0, p.accent);
+            theme::paint_icon(ui.painter(), r.shrink(13.0), Icon::File, Color32::WHITE);
+            ui.add_space(14.0);
+            ui.label(RichText::new("ProtoPDF").font(theme::medium(24.0)).color(p.text));
+            ui.add_space(18.0);
+            let open = egui::Button::new(RichText::new("Open a PDF").font(theme::medium(15.0)).color(p.on_primary))
+                .fill(p.primary)
+                .stroke(Stroke::NONE)
+                .corner_radius(10)
+                .min_size(vec2(180.0, 40.0));
+            if ui.add(open).clicked() {
                 acts.push(Act::Open);
             }
             ui.add_space(8.0);
-            ui.label("or drop a file on this window");
+            ui.label(RichText::new("or drop a file on this window").size(13.0).color(p.muted));
+            if !recent.is_empty() {
+                ui.add_space(28.0);
+                ui.label(RichText::new("Recent").size(13.0).color(p.muted));
+                ui.add_space(4.0);
+                let w = 320.0f32.min(ui.available_width());
+                ui.allocate_ui(vec2(w, recent.len() as f32 * 36.0), |ui| {
+                    ui.set_width(w);
+                    for r in &recent {
+                        let name = r.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        if theme::list_row(ui, &p, &name, false).on_hover_text(r.display().to_string()).clicked() {
+                            acts.push(Act::OpenPath(r.clone()));
+                        }
+                    }
+                });
+            }
         });
     }
 
     fn pages(&mut self, ui: &mut egui::Ui, acts: &mut Vec<Act>) {
-        let dark = ui.visuals().dark_mode;
-        let bg = if dark { Color32::from_gray(40) } else { Color32::from_gray(212) };
-        let frame = egui::Frame::NONE.fill(bg);
+        let frame = egui::Frame::NONE.fill(self.pal.canvas);
         if self.doc.as_ref().is_none_or(|d| d.sizes.is_empty()) {
             let empty = self.doc.is_none();
-            egui::CentralPanel::default().show(ui, |ui| {
+            egui::CentralPanel::default().frame(egui::Frame::NONE.fill(self.pal.bg)).show(ui, |ui| {
                 if empty {
-                    Self::welcome(ui, acts);
+                    self.welcome(ui, acts);
                 } else {
                     ui.centered_and_justified(|ui| ui.spinner());
                 }
@@ -1899,7 +2477,7 @@ impl App {
             return;
         }
 
-        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+        let view = egui::CentralPanel::default().frame(frame).show(ui, |ui| {
             self.view_size = ui.available_size();
             let loaded = self.doc.as_ref().is_some_and(|d| d.loaded);
             if loaded && self.init_zoom {
@@ -1952,7 +2530,7 @@ impl App {
             let snap = |v: f32| (v * ppp).round() / ppp;
 
             let out = area.show_viewport(ui, |ui, viewport| {
-                let total = vec2(lay.w.max(viewport.width()), lay.h.max(viewport.height()));
+                let total = vec2(lay.w.max(viewport.width()), (lay.h + BOTTOM_PAD).max(viewport.height()));
                 let (rect, resp) = ui.allocate_exact_size(total, Sense::click_and_drag());
                 let painter = ui.painter().clone();
                 let page_rect = |i: usize| {
@@ -2416,6 +2994,8 @@ impl App {
                 }
             }
         });
+        let ctx = ui.ctx().clone();
+        self.overlay(&ctx, view.response.rect, acts);
     }
 
     fn dialogs(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
@@ -2830,6 +3410,16 @@ impl App {
                 self.side_tab = SideTab::Contents;
                 return;
             }
+            "comments" => {
+                self.show_thumbs = true;
+                self.side_tab = SideTab::Comments;
+                return;
+            }
+            "find" => {
+                self.search.query = arg.to_string();
+                return;
+            }
+            "theme" => Act::ToggleTheme,
             // goto:<n> follows the n-th entry of the contents; link:<n> the n-th link on this page.
             "goto" | "link" => {
                 let Some(info) = self.info.clone() else { return };
@@ -2928,34 +3518,29 @@ impl App {
     }
 }
 
-/// The Print toolbar button: a printer drawn with shapes, so it looks the same
-/// whatever fonts are installed.
-fn printer_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
-    let h = ui.spacing().interact_size.y;
-    let sense = if enabled { Sense::click() } else { Sense::hover() };
-    let (rect, resp) = ui.allocate_exact_size(vec2(h + 12.0, h), sense);
-    if ui.is_rect_visible(rect) {
-        let (bg, ink, radius) = if enabled {
-            let v = ui.style().interact(&resp);
-            (v.weak_bg_fill, v.fg_stroke.color, v.corner_radius)
-        } else {
-            let v = &ui.visuals().widgets.inactive;
-            (v.weak_bg_fill.gamma_multiply(0.5), v.fg_stroke.color.gamma_multiply(0.4), v.corner_radius)
-        };
-        let p = ui.painter();
-        p.rect_filled(rect, radius, bg);
-        let c = rect.center();
-        let at = |x0: f32, y0: f32, x1: f32, y1: f32| Rect::from_min_max(c + vec2(x0, y0), c + vec2(x1, y1));
-        let line = Stroke::new(1.3, ink);
-        // Sheet going in at the top, the printer body, and the printed sheet coming out.
-        p.rect_stroke(at(-4.0, -7.5, 4.0, -2.5), 0.5, line, StrokeKind::Inside);
-        p.rect_filled(at(-8.0, -3.5, 8.0, 3.5), 1.5, ink);
-        p.rect_filled(at(-4.5, 0.5, 4.5, 7.5), 0.5, bg);
-        p.rect_stroke(at(-4.5, 0.5, 4.5, 7.5), 0.5, line, StrokeKind::Inside);
-        p.line_segment([c + vec2(-2.0, 3.5), c + vec2(2.0, 3.5)], Stroke::new(1.0, ink));
-        p.line_segment([c + vec2(-2.0, 5.5), c + vec2(2.0, 5.5)], Stroke::new(1.0, ink));
+/// "A4", "Letter" and friends, when the page is one of them (either way up).
+fn paper_name(w: f32, h: f32) -> Option<&'static str> {
+    let (a, b) = (w.min(h), w.max(h));
+    const PAPERS: [(&str, f32, f32); 6] = [
+        ("A4", 595.3, 841.9),
+        ("A3", 841.9, 1190.6),
+        ("A5", 419.5, 595.3),
+        ("Letter", 612.0, 792.0),
+        ("Legal", 612.0, 1008.0),
+        ("B5", 498.9, 708.7),
+    ];
+    PAPERS.iter().find(|(_, pw, ph)| (a - pw).abs() < 3.0 && (b - ph).abs() < 3.0).map(|p| p.0)
+}
+
+fn human_size(bytes: usize) -> String {
+    let b = bytes as f64;
+    if b < 1024.0 {
+        format!("{bytes} B")
+    } else if b < 1024.0 * 1024.0 {
+        format!("{:.0} KB", b / 1024.0)
+    } else {
+        format!("{:.1} MB", b / (1024.0 * 1024.0))
     }
-    resp
 }
 
 /// Parse "1-3, 5" into 0-based page indices. `None` if anything is out of range.
@@ -2989,10 +3574,17 @@ impl eframe::App for App {
             acts.append(&mut self.queued);
         }
         self.shortcuts(&ctx, &mut acts);
-        self.top_bar(ui, &mut acts);
-        self.status_bar(ui);
-        if self.show_thumbs && self.doc.as_ref().is_some_and(|d| !d.sizes.is_empty()) {
-            self.thumbs_panel(ui, &mut acts);
+        // Narrow windows drop the side panels before squeezing the pages.
+        let width = ctx.content_rect().width();
+        let side_open = self.show_thumbs && width >= 720.0;
+        let has_pages = self.doc.as_ref().is_some_and(|d| !d.sizes.is_empty());
+        let panel_open = self.show_panel && has_pages && width >= 1020.0 - if side_open { 0.0 } else { SIDEBAR_W };
+        if side_open {
+            self.side_panel(ui, &mut acts);
+        }
+        self.top_bar(ui, &mut acts, side_open, panel_open);
+        if panel_open {
+            self.info_panel(ui, &mut acts);
         }
         self.pages(ui, &mut acts);
         self.dialogs(&ctx, &mut acts);

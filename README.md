@@ -1,8 +1,29 @@
 # ProtoPDF
 
-A small, fast PDF reader for Windows and Linux written entirely in Rust. It opens a 200 page manual in under a second, does the page edits people need most often, and prints through the normal Windows print dialog, or through CUPS on Linux.
+Lightweight Rust alternative to Adobe Acrobat Reader. Opens faster, far less bloated, and has EXACTLY what you would expect from a PDF reader: printing, page editing, e-signatures, form filling. Runs on Windows and Linux.
+
+Built it because I got super frustrated with Acrobat. Now I don't have to think about my PDF reader at all, it just does what it should.
+
+![ProtoPDF in dark mode with a signed contract open: page list and recent files on the left, signature check and comments on the right, find bar at the bottom](docs/screenshot-dark.png)
+
+<details>
+<summary>Light mode</summary>
+
+![ProtoPDF in light mode, searching the contract for "milestone"](docs/screenshot-light.png)
+
+</details>
+
+Written entirely in Rust, it opens a 200 page manual in under a second and prints through the normal Windows print dialog, or through CUPS on Linux.
 
 ## What it does
+
+The window
+- Sidebar on the left: open, find and print, the page list (or contents, or comments) and recently opened files
+- Document panel on the right: page count and size, who signed the document and whether the signature holds, the comments, and unsaved changes with a Save button
+- Find box at the bottom, with page and zoom controls next to it. The signature check sits just above it
+- Tools as icons in the top bar. Every other command is in the menu under the file name
+- Dark and light mode: the sun / moon button at the bottom of the sidebar, or View in the file menu. The mode, the open panels and the recent files are remembered
+- Narrow windows hide the document panel first, then the sidebar
 
 Reading
 - Continuous scrolling, zoom (25% to 600%), fit width, fit page
@@ -112,6 +133,7 @@ ProtoPDF.exe --verify file.pdf             check the signatures and print the re
 ProtoPDF.exe --sign in.pdf out.pdf --thumbprint HEX [--page 1 --rect 330,640,520,688 --reason text --location text]
 ProtoPDF.exe --register                    register as a PDF app and open the Windows default apps page
 ProtoPDF.exe --unregister                  remove the registration
+ProtoPDF.exe file.pdf --theme light --size 1440x900 --screenshot out.png   picture of the window (theme not remembered)
 ```
 
 On Linux the switches are the same, with these differences:
@@ -129,11 +151,11 @@ PROTOPDF_P12_PASSWORD=... protopdf --sign in.pdf out.pdf --p12 me.p12 [--page 1 
 | Rendering and text extraction | [hayro](https://github.com/LaurenzV/hayro), a pure Rust PDF renderer |
 | Page edits and saving | [lopdf](https://github.com/J-F-Liu/lopdf) |
 | Fonts for added text | [ttf-parser](https://github.com/harfbuzz/ttf-parser) and [subsetter](https://github.com/typst/subsetter) |
-| Window and controls | [egui / eframe](https://github.com/emilk/egui) |
+| Window and controls | [egui / eframe](https://github.com/emilk/egui); interface fonts [Onest](https://github.com/googlefonts/onest) and [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono), both under the SIL Open Font License (`assets/fonts`) |
 | Signatures | Windows CryptoAPI through the windows crate; on Linux [OpenSSL](https://github.com/sfackler/rust-openssl): PKCS#7 / CMS signing, verification, certificate chains, timestamps |
 | Print dialog, printing, registry | [windows](https://github.com/microsoft/windows-rs), [winreg](https://github.com/gentoo90/winreg-rs); on Linux CUPS (`lp`), and a freedesktop.org desktop entry with `xdg-mime` |
 
-Source layout: `src/render.rs` (background render threads), `src/text.rs` (search and selection), `src/edit.rs` (edits, comments, form filling), `src/info.rs` (links, contents, comments and form fields read from the file), `src/sign.rs` (signatures, with the cryptography in `src/sign_windows.rs` and `src/sign_openssl.rs`), `src/print_windows.rs` and `src/print_linux.rs`, `src/register_windows.rs` and `src/register_linux.rs`, `src/fonts.rs` (finding system fonts), `src/app.rs` (the window).
+Source layout: `src/render.rs` (background render threads), `src/text.rs` (search and selection), `src/edit.rs` (edits, comments, form filling), `src/info.rs` (links, contents, comments and form fields read from the file), `src/sign.rs` (signatures, with the cryptography in `src/sign_windows.rs` and `src/sign_openssl.rs`), `src/print_windows.rs` and `src/print_linux.rs`, `src/register_windows.rs` and `src/register_linux.rs`, `src/fonts.rs` (finding system fonts), `src/app.rs` (the window), `src/theme.rs` (colours, interface fonts, icons), `src/settings.rs` (remembered preferences).
 
 ## Tests
 
