@@ -282,6 +282,8 @@ pub struct App {
     print_rx: Option<Receiver<print::Progress>>,
     /// The open print dialog.
     print_setup: Option<print::Setup>,
+    /// The frame at which the window's title bar is made to match the theme.
+    title_bar_at: u64,
     /// Windows: the certificate to sign with, and its name.
     #[cfg(windows)]
     sign_cert: Option<(sign::Cert, String)>,
@@ -379,6 +381,7 @@ impl App {
             edit_rx: None,
             print_rx: None,
             print_setup: None,
+            title_bar_at: 4,
             #[cfg(windows)]
             sign_cert: None,
             sig_preview: None,
@@ -1250,6 +1253,7 @@ impl App {
                 self.settings.light = !self.settings.light;
                 self.pal = theme::palette(!self.settings.light);
                 theme::set_dark(ctx, !self.settings.light);
+                self.title_bar_at = self.frame + 3;
                 self.settings.save();
             }
             Act::MakeDefault => {
@@ -1859,6 +1863,9 @@ impl App {
                 }
             });
             ui.add_space(6.0);
+            if theme::nav_row(ui, &p, Icon::Save, "Save as", "", has && !self.busy()).on_hover_text("Save this PDF in a folder you choose").clicked() {
+                acts.push(Act::SaveAs);
+            }
             if theme::nav_row(ui, &p, Icon::Folder, "Open file", "Ctrl O", true).clicked() {
                 acts.push(Act::Open);
             }
@@ -3733,9 +3740,13 @@ fn parse_pages(s: &str, n: usize) -> Option<Vec<usize>> {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.frame += 1;
+        // Once the window is up, and after every theme change, a few frames later.
+        if self.frame == self.title_bar_at {
+            theme::sync_title_bar(frame, !self.settings.light);
+        }
         self.poll(&ctx);
 
         let mut acts = Vec::new();

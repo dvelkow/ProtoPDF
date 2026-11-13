@@ -230,6 +230,7 @@ pub enum Icon {
     ChevronUp,
     ChevronDown,
     Folder,
+    Save,
     Search,
     Printer,
     Highlighter,
@@ -296,6 +297,11 @@ pub fn paint_icon(p: &Painter, rect: Rect, icon: Icon, color: Color32) {
         Icon::ChevronUp => line(&[(6.0, 15.0), (12.0, 9.0), (18.0, 15.0)]),
         Icon::ChevronDown => line(&[(6.0, 9.0), (12.0, 15.0), (18.0, 9.0)]),
         Icon::Folder => closed(&[(3.0, 6.0), (9.0, 6.0), (11.0, 8.0), (21.0, 8.0), (21.0, 19.0), (3.0, 19.0)]),
+        Icon::Save => {
+            line(&[(12.0, 4.0), (12.0, 15.0)]);
+            line(&[(7.5, 10.5), (12.0, 15.0), (16.5, 10.5)]);
+            line(&[(4.0, 16.0), (4.0, 20.0), (20.0, 20.0), (20.0, 16.0)]);
+        }
         Icon::Search => {
             circle(11.0, 11.0, 6.5);
             line(&[(16.0, 16.0), (20.0, 20.0)]);
@@ -589,3 +595,34 @@ pub fn avatar(ui: &mut Ui, p: &Palette, name: &str) {
     ui.painter().circle_filled(rect.center(), 17.0, bg);
     ui.painter().text(rect.center(), Align2::CENTER_CENTER, if initials.is_empty() { "?".into() } else { initials }, medium(12.0), fg);
 }
+
+/// Windows: make the title bar match the theme and repaint it. When Windows
+/// itself is in light mode the window opens with a light title bar and is
+/// turned dark afterwards; Windows then leaves the minimise, maximise and
+/// close buttons drawn dark on dark (invisible until the mouse is over them)
+/// unless the frame is told to redraw.
+#[cfg(windows)]
+pub fn sync_title_bar(frame: &eframe::Frame, dark: bool) {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetWindowPos,
+        WM_NCACTIVATE,
+    };
+    let Ok(handle) = frame.window_handle() else { return };
+    let RawWindowHandle::Win32(h) = handle.as_raw() else { return };
+    let hwnd = HWND(h.hwnd.get() as *mut core::ffi::c_void);
+    unsafe {
+        let on: i32 = dark as i32;
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, (&on as *const i32).cast(), 4);
+        let _ = SetWindowPos(hwnd, None, 0, 0, 0, 0, SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        // Flipping the active state and back is what makes Windows 10 redraw the buttons.
+        let active = GetForegroundWindow() == hwnd;
+        SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(!active as usize)), Some(LPARAM(0)));
+        SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(active as usize)), Some(LPARAM(0)));
+    }
+}
+
+#[cfg(not(windows))]
+pub fn sync_title_bar(_frame: &eframe::Frame, _dark: bool) {}

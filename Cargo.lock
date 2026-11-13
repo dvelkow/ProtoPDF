@@ -3137,6 +3137,7 @@ dependencies = [
  "image",
  "lopdf",
  "openssl",
+ "raw-window-handle",
  "rfd",
  "subsetter",
  "ttf-parser",
