@@ -308,9 +308,23 @@ impl Drop for Cert {
     }
 }
 
+impl Clone for Cert {
+    fn clone(&self) -> Self {
+        Cert(unsafe { CertDuplicateCertificateContext(Some(self.0)) })
+    }
+}
+
 impl Cert {
     pub fn name(&self) -> String {
         unsafe { cert_text(self.0, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, None) }
+    }
+
+    /// SHA-1 thumbprint in hex, to find the certificate again with `find_certificate`.
+    pub fn thumbprint(&self) -> String {
+        let mut hash = [0u8; 20];
+        let mut cb = 20u32;
+        let ok = unsafe { CertGetCertificateContextProperty(self.0, CERT_SHA1_HASH_PROP_ID, Some(hash.as_mut_ptr().cast()), &mut cb) }.is_ok();
+        if ok { hash.iter().map(|b| format!("{b:02X}")).collect() } else { String::new() }
     }
 }
 

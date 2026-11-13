@@ -171,9 +171,11 @@ enum Act {
     Save,
     SaveAs,
     Print,
-    /// Linux: the print dialog was confirmed.
-    #[cfg(not(windows))]
+    /// The print dialog was confirmed.
     PrintGo(print::PrintJob),
+    /// Windows: choose the certificate to sign with.
+    #[cfg(windows)]
+    PickCert,
     Undo,
     Redo,
     Copy,
@@ -278,9 +280,14 @@ pub struct App {
     status: String,
     edit_rx: Option<Receiver<EditDone>>,
     print_rx: Option<Receiver<print::Progress>>,
-    /// Linux: the open print dialog.
-    #[cfg(not(windows))]
+    /// The open print dialog.
     print_setup: Option<print::Setup>,
+    /// Windows: the certificate to sign with, and its name.
+    #[cfg(windows)]
+    sign_cert: Option<(sign::Cert, String)>,
+    /// What the visible signature will look like, for the box shown while
+    /// placing it: what it was made from, and the image (none if it failed).
+    sig_preview: Option<(String, Option<TextureHandle>)>,
     /// Linux: the certificate file (.p12 / .pfx) to sign with, and its password.
     #[cfg(not(windows))]
     p12: (Option<PathBuf>, String),
@@ -371,8 +378,10 @@ impl App {
             status: String::new(),
             edit_rx: None,
             print_rx: None,
-            #[cfg(not(windows))]
             print_setup: None,
+            #[cfg(windows)]
+            sign_cert: None,
+            sig_preview: None,
             #[cfg(not(windows))]
             p12: (None, String::new()),
             confirm_close: false,
@@ -925,6 +934,62 @@ impl App {
         (!s.trim().is_empty()).then_some(s)
     }
 
+    /// Windows: sign with this certificate from now on, also next time.
+    #[cfg(windows)]
+    fn use_cert(&mut self, cert: sign::Cert) {
+        let thumb = cert.thumbprint();
+        if !thumb.is_empty() && thumb != self.settings.sign_cert {
+            self.settings.sign_cert = thumb;
+            self.settings.save();
+        }
+        let name = cert.name();
+        self.sign_cert = Some((cert, name));
+    }
+
+    /// The name the new signature will show.
+    fn signer_name(&self) -> String {
+        #[cfg(windows)]
+        if let Some((_, name)) = &self.sign_cert {
+            return name.clone();
+        }
+        "Your name".into()
+    }
+
+    /// Draw what the visible signature will look like, with the same code that
+    /// signs, at the size the page is shown. Only redone when something changes.
+    fn update_sig_preview(&mut self, ctx: &egui::Context, px_per_pt: f32) {
+        let Some(d) = self.sign_draft.as_ref().filter(|d| d.visible) else {
+            self.sig_preview = None;
+            return;
+        };
+        let name = self.signer_name();
+        let px = ((SIG_W * px_per_pt / 128.0).ceil() * 128.0).clamp(256.0, 2048.0) as u32;
+        let minute = chrono::Local::now().format("%Y%m%d%H%M");
+        let key = format!("{name}\u{1}{}\u{1}{minute}\u{1}{px}", d.reason.trim());
+        if self.sig_preview.as_ref().is_some_and(|(k, _)| *k == key) {
+            return;
+        }
+        let img = sign::preview_pdf(SIG_W, SIG_H, &name, &d.reason)
+            .ok()
+            .and_then(|pdf| crate::render::render_one(Arc::new(pdf), "", 0, px, 4096));
+        let tex = img.map(|(w, h, mut rgba)| {
+            // Rendered on white; take the white out so the page shows through, as it will in the signed file.
+            for c in rgba.chunks_exact_mut(4) {
+                let a = 255 - c[0].min(c[1]).min(c[2]);
+                if a == 0 {
+                    c.fill(0);
+                } else {
+                    for v in &mut c[..3] {
+                        *v = ((*v as i32 - (255 - a as i32)).max(0) * 255 / a as i32) as u8;
+                    }
+                    c[3] = a;
+                }
+            }
+            ctx.load_texture("sig_preview", egui::ColorImage::from_rgba_unmultiplied([w, h], &rgba), TextureOptions::LINEAR)
+        });
+        self.sig_preview = Some((key, tex));
+    }
+
     fn start_print(&mut self, ctx: &egui::Context, job: print::PrintJob) {
         let Some(doc) = &self.doc else { return };
         let (tx, rx) = channel();
@@ -990,15 +1055,20 @@ impl App {
                     return;
                 }
                 #[cfg(windows)]
-                if let Some(job) = print::choose_printer(n, cur) {
-                    self.start_print(ctx, job);
+                {
+                    self.print_setup = Some(print::Setup::new(doc.sizes.clone(), cur, doc.bytes.clone(), doc.password.clone(), ctx));
                 }
                 #[cfg(not(windows))]
                 {
                     self.print_setup = Some(print::Setup::new(n, cur));
                 }
             }
-            #[cfg(not(windows))]
+            #[cfg(windows)]
+            Act::PickCert => match sign::pick_certificate() {
+                Ok(Some(cert)) => self.use_cert(cert),
+                Ok(None) => {}
+                Err(e) => self.error = Some(e),
+            },
             Act::PrintGo(job) => {
                 self.print_setup = None;
                 if self.doc.as_ref().is_some_and(|d| d.loaded) && self.print_rx.is_none() {
@@ -1269,22 +1339,36 @@ impl App {
                 self.draft = None;
                 if self.tool == Tool::PlaceSig {
                     self.status = "Click on the page where the signature should appear".into();
+                    // The certificate used last time, so the preview shows the right name at once.
+                    #[cfg(windows)]
+                    if self.sign_cert.is_none() && !self.settings.sign_cert.is_empty() {
+                        if let Some(cert) = sign::find_certificate(&self.settings.sign_cert) {
+                            let name = cert.name();
+                            self.sign_cert = Some((cert, name));
+                        }
+                    }
                 }
             }
             Act::SignGo => {
-                let (Some(d), Some(doc)) = (self.sign_draft.as_ref(), self.doc.as_ref()) else { return };
-                if self.busy() || !doc.loaded {
+                if self.sign_draft.is_none() || self.busy() || !self.doc.as_ref().is_some_and(|d| d.loaded) {
                     return;
                 }
                 #[cfg(windows)]
-                let cert = match sign::pick_certificate() {
-                    Ok(Some(cert)) => cert,
-                    Ok(None) => return,
-                    Err(e) => {
-                        self.error = Some(e);
-                        return;
-                    }
+                let cert = match self.sign_cert.as_ref() {
+                    Some((cert, _)) => cert.clone(),
+                    None => match sign::pick_certificate() {
+                        Ok(Some(cert)) => {
+                            self.use_cert(cert.clone());
+                            cert
+                        }
+                        Ok(None) => return,
+                        Err(e) => {
+                            self.error = Some(e);
+                            return;
+                        }
+                    },
                 };
+                let (Some(d), Some(doc)) = (self.sign_draft.as_ref(), self.doc.as_ref()) else { return };
                 #[cfg(not(windows))]
                 let cert = match self.p12.0.as_deref() {
                     None => {
@@ -1342,10 +1426,7 @@ impl App {
 
     fn shortcuts(&mut self, ctx: &egui::Context, acts: &mut Vec<Act>) {
         let typing = ctx.egui_wants_keyboard_input();
-        #[cfg(not(windows))]
         let printing = self.print_setup.is_some();
-        #[cfg(windows)]
-        let printing = false;
         let modal = printing || self.password.is_some() || self.error.is_some() || self.confirm_close || self.extract.is_some() || self.pending_edit.is_some();
         let hit = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_key(m, k));
         let ctrl = Modifiers::COMMAND;
@@ -2409,11 +2490,27 @@ impl App {
                                     .background_color(Color32::TRANSPARENT)
                                     .hint_text("Find in document…")
                                     .font(FontId::proportional(14.0))
+                                    // As tall as the buttons, text in the middle, so it lines up with the icon.
+                                    .min_size(vec2(0.0, 32.0))
+                                    .align(Align2::LEFT_CENTER)
                                     .desired_width(ui.available_width()),
                             );
                             if std::mem::take(&mut self.search.focus) {
                                 r.request_focus();
                             }
+                            r.context_menu(|ui| {
+                                let clip = arboard::Clipboard::new().and_then(|mut c| c.get_text()).unwrap_or_default();
+                                let clip = clip.split_whitespace().collect::<Vec<_>>().join(" ");
+                                if ui.add_enabled(!clip.is_empty(), egui::Button::new("Paste")).clicked() {
+                                    paste_into(ui.ctx(), find_id, &mut self.search.query, &clip);
+                                    ui.close();
+                                }
+                                if ui.add_enabled(!self.search.query.is_empty(), egui::Button::new("Clear")).clicked() {
+                                    self.search.query.clear();
+                                    ui.memory_mut(|m| m.request_focus(find_id));
+                                    ui.close();
+                                }
+                            });
                             if r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
                                 acts.push(Act::FindNext(!ui.input(|i| i.modifiers.shift)));
                                 r.request_focus();
@@ -2496,6 +2593,8 @@ impl App {
             let ppp = ctx.pixels_per_point();
             let max_side = ctx.input(|i| i.max_texture_side).min(8192) as f32;
             let frame_no = self.frame;
+            self.update_sig_preview(&ctx, self.zoom * PT_TO_PX * ppp);
+            let sig_tex = self.sig_preview.as_ref().and_then(|(_, t)| t.as_ref()).map(|t| t.id());
             let doc = self.doc.as_mut().unwrap();
             let lay = layout(&doc.sizes, self.zoom);
             let n = doc.sizes.len();
@@ -2529,6 +2628,8 @@ impl App {
             let jobs = &mut self.jobs_view;
             let mut cur_page = self.cur_page;
             let snap = |v: f32| (v * ppp).round() / ppp;
+            // Screen area of the selected text, for the Copy button next to it.
+            let mut sel_box: Option<Rect> = None;
 
             let out = area.show_viewport(ui, |ui, viewport| {
                 let total = vec2(lay.w.max(viewport.width()), (lay.h + BOTTOM_PAD).max(viewport.height()));
@@ -2597,6 +2698,7 @@ impl App {
                                     r.min + vec2(q[2], q[3]) * lay.ppt,
                                 );
                                 painter.rect_filled(hr, 0.0, Color32::from_rgba_unmultiplied(40, 110, 255, 75));
+                                sel_box = Some(sel_box.map_or(hr, |b| b.union(hr)));
                             }
                         }
                     } else if loaded {
@@ -2822,9 +2924,17 @@ impl App {
                     if let Some(d) = sign_draft.as_ref().filter(|d| d.page == i && d.visible) {
                         let box_rect = Rect::from_min_size(r.min + vec2(d.x, d.y) * lay.ppt, vec2(SIG_W, SIG_H) * lay.ppt);
                         let blue = Color32::from_rgb(33, 97, 184);
-                        painter.rect_filled(box_rect, 0.0, Color32::from_rgba_unmultiplied(33, 97, 184, 28));
-                        painter.rect_stroke(box_rect, 0.0, Stroke::new(1.5, blue), StrokeKind::Inside);
-                        painter.text(box_rect.center(), Align2::CENTER_CENTER, "Signature", FontId::proportional(11.0 * lay.ppt), blue);
+                        painter.rect_filled(box_rect, 0.0, Color32::from_rgba_unmultiplied(33, 97, 184, 14));
+                        match sig_tex {
+                            // Exactly what the signed file will show.
+                            Some(tex) => {
+                                painter.image(tex, box_rect, uv, Color32::WHITE);
+                            }
+                            None => {
+                                painter.rect_stroke(box_rect, 0.0, Stroke::new(1.5, blue), StrokeKind::Inside);
+                                painter.text(box_rect.center(), Align2::CENTER_CENTER, "Signature", FontId::proportional(11.0 * lay.ppt), blue);
+                            }
+                        }
                     }
                 }
                 // Neighbours are rendered ahead so scrolling does not show blank pages.
@@ -2957,6 +3067,34 @@ impl App {
             self.scroll = out.state.clamped_offset();
             self.cur_page = cur_page;
 
+            // Selected text gets a Copy button just under it, once the mouse is let go.
+            let dragging = ctx.input(|i| i.pointer.primary_down());
+            if let Some(b) = sel_box.filter(|b| !dragging && out.inner_rect.intersects(*b)) {
+                let size = vec2(76.0, 30.0);
+                let below = b.bottom() + 6.0 + size.y <= out.inner_rect.bottom() - FIND_BAR_ROOM;
+                let y = if below { b.bottom() + 6.0 } else { b.top() - 6.0 - size.y };
+                let x = b.center().x.clamp(out.inner_rect.left() + size.x * 0.5 + 4.0, out.inner_rect.right() - size.x * 0.5 - 4.0);
+                let p = self.pal;
+                egui::Area::new(egui::Id::unique("sel_copy"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(pos2(x - size.x * 0.5, y.max(out.inner_rect.top() + 4.0)))
+                    .show(&ctx, |ui| {
+                        Frame::new()
+                            .fill(p.raised)
+                            .stroke(Stroke::new(1.0, p.border))
+                            .corner_radius(8)
+                            .inner_margin(Margin::same(3))
+                            .shadow(Shadow { offset: [0, 4], blur: 12, spread: 0, color: p.shadow })
+                            .show(ui, |ui| {
+                                ui.spacing_mut().button_padding = vec2(16.0, 4.0);
+                                let copy = egui::Button::new(RichText::new("Copy").size(13.5).color(p.text)).frame(false);
+                                if ui.add(copy).on_hover_text("Copy the selected text (Ctrl+C)").clicked() {
+                                    acts.push(Act::Copy);
+                                }
+                            });
+                    });
+            }
+
             // The list of an open drop-down field.
             if let Some((wid, at, opened)) = self.choice_open {
                 let widget = self.info.as_ref().and_then(|inf| inf.widget(wid).map(|w| (w.field, &w.kind)));
@@ -3065,7 +3203,6 @@ impl App {
             }
         }
 
-        #[cfg(not(windows))]
         if let Some(setup) = self.print_setup.as_mut() {
             match setup.show(ctx) {
                 Some(Some(job)) => acts.push(Act::PrintGo(job)),
@@ -3159,6 +3296,8 @@ impl App {
 
         #[cfg(not(windows))]
         let p12 = &mut self.p12;
+        #[cfg(windows)]
+        let cert_name = self.sign_cert.as_ref().map(|(_, n)| n.clone());
         if let Some(d) = self.sign_draft.as_mut() {
             let mut open = true;
             egui::Window::new("Sign document")
@@ -3183,8 +3322,21 @@ impl App {
                     });
                     ui.add_space(6.0);
                     #[cfg(windows)]
-                    if ui.button("Choose certificate and sign...").clicked() {
-                        acts.push(Act::SignGo);
+                    {
+                        egui::Grid::new("sign_cert").num_columns(2).show(ui, |ui| {
+                            ui.label("Certificate");
+                            ui.horizontal(|ui| {
+                                ui.add_sized([150.0, 18.0], egui::Label::new(cert_name.as_deref().unwrap_or("none chosen")).truncate());
+                                if ui.button("Choose...").clicked() {
+                                    acts.push(Act::PickCert);
+                                }
+                            });
+                            ui.end_row();
+                        });
+                        ui.add_space(6.0);
+                        if ui.button("Sign...").clicked() {
+                            acts.push(Act::SignGo);
+                        }
                     }
                     #[cfg(not(windows))]
                     {
@@ -3478,8 +3630,7 @@ impl App {
                 return;
             }
             "editsigned" => Act::EditSigned(true),
-            // Opens the print dialog (Linux only: the Windows one would block the automation).
-            #[cfg(not(windows))]
+            // Opens the print dialog.
             "print" => Act::Print,
             "placesig" => {
                 let mut it = arg.split(',');
@@ -3517,6 +3668,24 @@ impl App {
         };
         self.act(ctx, act);
     }
+}
+
+/// Put `text` into a one-line text box at its cursor, replacing what is selected.
+fn paste_into(ctx: &egui::Context, id: egui::Id, value: &mut String, text: &str) {
+    use egui::text::{CCursor, CCursorRange};
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    let len = value.chars().count();
+    let (a, b) = state.cursor.char_range().map_or((len, len), |r| {
+        let (x, y) = (usize::from(r.primary.index).min(len), usize::from(r.secondary.index).min(len));
+        (x.min(y), x.max(y))
+    });
+    let start = value.char_indices().nth(a).map_or(value.len(), |(i, _)| i);
+    let end = value.char_indices().nth(b).map_or(value.len(), |(i, _)| i);
+    value.replace_range(start..end, text);
+    let at = a + text.chars().count();
+    state.cursor.set_char_range(Some(CCursorRange::one(CCursor::new(at))));
+    state.store(ctx, id);
+    ctx.memory_mut(|m| m.request_focus(id));
 }
 
 /// "A4", "Letter" and friends, when the page is one of them (either way up).

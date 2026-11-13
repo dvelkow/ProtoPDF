@@ -215,6 +215,16 @@ fn worker(
     }
 }
 
+/// Open a PDF and render one of its pages, for small one-off images.
+pub fn render_one(bytes: Arc<Vec<u8>>, password: &str, index: usize, width: u32, max_side: u32) -> Option<(usize, usize, Vec<u8>)> {
+    let pdf = open_pdf(bytes, password).ok()?;
+    let pages = pdf.pages();
+    let page = pages.get(index)?;
+    let cache = RenderCache::new();
+    let settings = interpreter_settings();
+    catch_unwind(AssertUnwindSafe(|| render_page(page, &cache, &settings, width, max_side))).ok()
+}
+
 /// Render a page `width` pixels wide (capped so neither side exceeds `max_side`).
 /// Returns width, height and opaque RGBA pixels.
 pub fn render_page<'a>(

@@ -443,6 +443,59 @@ fn push_to_array(inc: &mut IncrementalDocument, dict: &mut Dictionary, key: &str
     Ok(())
 }
 
+/// The date as a visible signature shows it.
+fn stamp_date(now: &chrono::DateTime<chrono::Local>) -> String {
+    now.format("%Y-%m-%d %H:%M %:z").to_string()
+}
+
+/// What a visible signature shows in a `w` x `h` box: the content operators,
+/// and the font they use (added to `doc`, named /F1).
+fn appearance(doc: &mut Document, w: f32, h: f32, name: &str, date: &str, reason: &str) -> Result<(String, ObjectId), String> {
+    let label = if backend::ui_is_bulgarian() { "Електронно подписано от" } else { "Digitally signed by" };
+    let font = edit::embed_font(doc, &format!("{label}{name}{date}{reason}"))?;
+    let pad = 5.0;
+    let mut name_size = (h * 0.22).clamp(6.0, 11.0);
+    while name_size > 4.5 && font.width(name, name_size) > w - 2.0 * pad {
+        name_size -= 0.5;
+    }
+    let small = (h * 0.14).clamp(4.5, 7.0);
+    let mut ops = format!("q\n0.13 0.38 0.72 RG 0.8 w 0.4 0.4 {:.2} {:.2} re S\nBT\n", w - 0.8, h - 0.8);
+    let mut line = |text: &str, size: f32, y: f32, gray: f32| {
+        if !text.is_empty() {
+            ops.push_str(&format!("/F1 {size:.2} Tf {gray} g 1 0 0 1 {pad} {y:.2} Tm <{}> Tj\n", font.hex(text)));
+        }
+    };
+    line(label, small, h - pad - small, 0.35);
+    line(name, name_size, h - pad - small - name_size - 2.0, 0.0);
+    line(date, small, h - pad - small - name_size - small - 5.0, 0.35);
+    line(reason, small, h - pad - small - name_size - 2.0 * small - 7.0, 0.35);
+    ops.push_str("ET\nQ\n");
+    Ok((ops, font.id))
+}
+
+/// A one page PDF the size of the signature box that shows the signature as
+/// it will appear, drawn by the same code that signs. For the preview while
+/// the signature is being placed.
+pub fn preview_pdf(w: f32, h: f32, name: &str, reason: &str) -> Result<Vec<u8>, String> {
+    let mut doc = Document::with_version("1.7");
+    let (ops, font_id) = appearance(&mut doc, w, h, name, &stamp_date(&chrono::Local::now()), reason.trim())?;
+    let contents = doc.add_object(Stream::new(Dictionary::new(), ops.into_bytes()));
+    let pages_id = doc.new_object_id();
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![Object::Real(0.0), Object::Real(0.0), Object::Real(w), Object::Real(h)],
+        "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+        "Contents" => contents,
+    });
+    doc.objects.insert(pages_id, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![Object::Reference(page_id)], "Count" => 1 }));
+    let root = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", root);
+    let mut out = Vec::new();
+    doc.save_to(&mut out).map_err(err("Cannot build the preview"))?;
+    Ok(out)
+}
+
 /// Sign the PDF. The signature is appended to the file, so signatures that
 /// are already in it stay valid.
 pub fn sign_pdf(bytes: &[u8], cert: &Cert, opts: &SignOptions) -> Result<Vec<u8>, String> {
@@ -510,27 +563,7 @@ fn sign_inner(bytes: &[u8], cert: &Cert, opts: &SignOptions, may_rewrite: bool) 
             let ((bx, by), _) = edit::view_to_user(bbox, rot, x0.min(x1) + w, y0.min(y1) + h);
             widget.set("Rect", vec![Object::Real(ax.min(bx)), Object::Real(ay.min(by)), Object::Real(ax.max(bx)), Object::Real(ay.max(by))]);
 
-            let label = if backend::ui_is_bulgarian() { "Електронно подписано от" } else { "Digitally signed by" };
-            let date = now.format("%Y-%m-%d %H:%M %:z").to_string();
-            let reason = opts.reason.trim();
-            let font = edit::embed_font(&mut inc.new_document, &format!("{label}{name}{date}{reason}"))?;
-            let pad = 5.0;
-            let mut name_size = (h * 0.22).clamp(6.0, 11.0);
-            while name_size > 4.5 && font.width(&name, name_size) > w - 2.0 * pad {
-                name_size -= 0.5;
-            }
-            let small = (h * 0.14).clamp(4.5, 7.0);
-            let mut ops = format!("q\n0.13 0.38 0.72 RG 0.8 w 0.4 0.4 {:.2} {:.2} re S\nBT\n", w - 0.8, h - 0.8);
-            let mut line = |text: &str, size: f32, y: f32, gray: f32| {
-                if !text.is_empty() {
-                    ops.push_str(&format!("/F1 {size:.2} Tf {gray} g 1 0 0 1 {pad} {y:.2} Tm <{}> Tj\n", font.hex(text)));
-                }
-            };
-            line(label, small, h - pad - small, 0.35);
-            line(&name, name_size, h - pad - small - name_size - 2.0, 0.0);
-            line(&date, small, h - pad - small - name_size - small - 5.0, 0.35);
-            line(reason, small, h - pad - small - name_size - 2.0 * small - 7.0, 0.35);
-            ops.push_str("ET\nQ\n");
+            let (ops, font_id) = appearance(&mut inc.new_document, w, h, &name, &stamp_date(&now), opts.reason.trim())?;
             let ap = Stream::new(
                 dictionary! {
                     "Type" => "XObject",
@@ -538,7 +571,7 @@ fn sign_inner(bytes: &[u8], cert: &Cert, opts: &SignOptions, may_rewrite: bool) 
                     "FormType" => 1,
                     "BBox" => vec![Object::Real(0.0), Object::Real(0.0), Object::Real(w), Object::Real(h)],
                     "Matrix" => vec![Object::Real(m[0]), Object::Real(m[1]), Object::Real(m[2]), Object::Real(m[3]), Object::Real(0.0), Object::Real(0.0)],
-                    "Resources" => dictionary! { "Font" => dictionary! { "F1" => font.id } },
+                    "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
                 },
                 ops.into_bytes(),
             );

@@ -11,13 +11,15 @@ const MAX_RECENT: usize = 8;
 pub struct Settings {
     pub light: bool,
     pub recent: Vec<PathBuf>,
+    /// Windows: thumbprint of the certificate last signed with, chosen again next time.
+    pub sign_cert: String,
     /// False when the theme was forced from the command line: nothing is written then.
     pub persist: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { light: false, recent: Vec::new(), persist: true }
+        Self { light: false, recent: Vec::new(), sign_cert: String::new(), persist: true }
     }
 }
 
@@ -40,6 +42,7 @@ impl Settings {
             let Some((key, value)) = line.split_once('=') else { continue };
             match key.trim() {
                 "light" => s.light = value.trim() == "1",
+                "sign_cert" => s.sign_cert = value.trim().to_string(),
                 "recent" if !value.is_empty() && s.recent.len() < MAX_RECENT => s.recent.push(PathBuf::from(value)),
                 _ => {}
             }
@@ -53,6 +56,9 @@ impl Settings {
         }
         let Some(path) = file() else { return };
         let mut out = format!("light={}\n", if self.light { "1" } else { "0" });
+        if !self.sign_cert.is_empty() {
+            out.push_str(&format!("sign_cert={}\n", self.sign_cert));
+        }
         for r in &self.recent {
             if let Some(s) = r.to_str() {
                 out.push_str("recent=");

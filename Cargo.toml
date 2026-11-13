@@ -16,6 +16,8 @@ hayro-interpret = "0.9"
 hayro-syntax = "0.9"
 lopdf = "0.47"
 rfd = "0.18"
+# Already used by eframe; read directly for "Paste" in right-click menus.
+arboard = { version = "3", default-features = false }
 ttf-parser = "0.25"
 subsetter = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }

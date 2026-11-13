@@ -13,7 +13,7 @@ Built it because I got super frustrated with Acrobat. Now I don't have to think 
 
 </details>
 
-Written entirely in Rust, it opens a 200 page manual in under a second and prints through the normal Windows print dialog, or through CUPS on Linux.
+Written entirely in Rust, it opens a 200 page manual in under a second and prints to any Windows printer with a preview of every sheet, or through CUPS on Linux.
 
 ## What it does
 
@@ -29,7 +29,8 @@ Reading
 - Continuous scrolling, zoom (25% to 600%), fit width, fit page
 - Page list with thumbnails
 - Find text in the whole document, with highlights and next / previous
-- Select text with the mouse and copy it
+- Select text with the mouse and copy it (Ctrl+C, or the Copy button that appears next to the selection)
+- Right click the find box to paste into it
 - Links work: links to other pages jump there (Alt+Left goes back), web and mail links open in the browser or mail program
 - Contents panel with the document's bookmarks, next to the page thumbnails
 - Password protected files
@@ -48,12 +49,13 @@ Editing
 Digital signatures
 - Every signed PDF is checked when it is opened. A coloured bar says whether the document is unchanged and whether the signer is trusted, and Details lists each signature: who signed, when, the issuer, and any trusted timestamp
 - Sign with any certificate in the Windows certificate store, which includes qualified signatures on smart cards and USB tokens. Windows asks for the PIN
-- The signature can be shown on the page (click where it should go) or be invisible
+- The signature can be shown on the page (click where it should go) or be invisible. While placing it, the box shows exactly what the signed file will show: your name, the date and the reason
+- On Windows the certificate used last time is chosen again next time
 - Signing appends to the file, so signatures that are already in it stay valid and several people can sign in turn
 - ProtoPDF warns before an edit that would break an existing signature
 
 Printing
-- Print button and Ctrl+P open the Windows print dialog: any installed printer, page range, copies
+- Print button and Ctrl+P open ProtoPDF's print dialog with a preview of each sheet as it will print: any installed printer, page range, copies, paper, orientation, color or black and white. "Printer settings..." opens the printer's own window (two-sided, tray, quality)
 - Landscape pages are turned to fill the sheet, oversized pages are shrunk to the printable area
 - Right click a PDF in Explorer and choose Print to print it without opening a window
 
