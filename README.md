@@ -19,6 +19,7 @@ Written entirely in Rust, it opens a 200 page manual in under a second and print
 
 The window
 - Sidebar on the left, open whenever a file opens: save as (a copy of the PDF in a folder you choose), open and find, the page list (or contents, or comments) and recently opened files
+- Click a recent file to switch to it in the same window. The file you had open moves to the top of the list, so one click brings it back. Unsaved changes are asked about first
 - Document panel on the right, opened with the button at the top right: page count and size, who signed the document and whether the signature holds, the comments, and unsaved changes with a Save button
 - Find box at the bottom, with page and zoom controls next to it. The signature check sits just above it
 - Tools and Print as icons in the top bar. Every other command is in the menu under the file name

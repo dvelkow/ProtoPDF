@@ -168,6 +168,8 @@ enum EditDone {
 enum Act {
     Open,
     OpenPath(PathBuf),
+    /// Show this file in this window in place of the open one (a click in the recent list).
+    Switch(PathBuf),
     Save,
     SaveAs,
     Print,
@@ -294,6 +296,8 @@ pub struct App {
     #[cfg(not(windows))]
     p12: (Option<PathBuf>, String),
     confirm_close: bool,
+    /// The file to switch to once "Save changes?" is answered; none when the window is closing.
+    switch_to: Option<PathBuf>,
     force_close: bool,
     jobs_view: Vec<Job>,
     jobs_thumb: Vec<Job>,
@@ -388,6 +392,7 @@ impl App {
             #[cfg(not(windows))]
             p12: (None, String::new()),
             confirm_close: false,
+            switch_to: None,
             force_close: false,
             jobs_view: Vec::new(),
             jobs_thumb: Vec::new(),
@@ -488,6 +493,31 @@ impl App {
                 self.settings.add_recent(path);
             }
             Err(e) => self.error = Some(format!("Cannot open {}\n{e}", path.display())),
+        }
+    }
+
+    /// Show another file in this window. The file that was open goes to the top
+    /// of the recent list, so one click brings it back.
+    fn switch_doc(&mut self, ctx: &egui::Context, path: &Path) {
+        let prev = self.doc.as_ref().and_then(|d| d.path.clone());
+        if prev.as_deref() == Some(path) {
+            return;
+        }
+        self.load(ctx, path);
+        // Still the old document: the file could not be read, and the error is on screen.
+        if self.doc.as_ref().and_then(|d| d.path.as_deref()) != Some(path) {
+            return;
+        }
+        self.print_setup = None;
+        self.password = None;
+        self.extract = None;
+        self.jump = None;
+        self.after_edit = None;
+        self.queued.clear();
+        self.thumb_follow = usize::MAX;
+        self.thumb_scroll = Some(0.0);
+        if let Some(prev) = prev {
+            self.settings.add_recent(&prev);
         }
     }
 
@@ -1046,6 +1076,19 @@ impl App {
                     let _ = std::process::Command::new(exe).arg(path).spawn();
                 }
             }
+            Act::Switch(path) => {
+                if self.doc.is_none() {
+                    self.load(ctx, &path);
+                } else if self.busy() {
+                    self.status = "One moment, the last change is still being made".into();
+                } else if self.is_dirty() {
+                    // Unsaved changes: ask first, then switch.
+                    self.switch_to = Some(path);
+                    self.confirm_close = true;
+                } else {
+                    self.switch_doc(ctx, &path);
+                }
+            }
             Act::Save => {
                 self.save(false);
             }
@@ -1275,9 +1318,15 @@ impl App {
             Act::CloseAnswer(answer) => {
                 self.confirm_close = false;
                 // 0 = save, 1 = discard, 2 = stay.
+                let switch = self.switch_to.take();
                 if answer == 1 || (answer == 0 && self.save(false)) {
-                    self.force_close = true;
-                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                    match switch {
+                        Some(path) => self.switch_doc(ctx, &path),
+                        None => {
+                            self.force_close = true;
+                            ctx.send_viewport_cmd(ViewportCommand::Close);
+                        }
+                    }
                 }
             }
             Act::CommitForm => self.commit_form(ctx, None),
@@ -1609,7 +1658,7 @@ impl App {
                 for p in &recent {
                     let name = p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
                     if ui.button(name).on_hover_text(p.display().to_string()).clicked() {
-                        acts.push(Act::OpenPath(p.clone()));
+                        acts.push(Act::Switch(p.clone()));
                         ui.close();
                     }
                 }
@@ -1907,7 +1956,7 @@ impl App {
                     let here = cur_path.as_ref() == Some(r);
                     let resp = theme::list_row(ui, &p, &name, here).on_hover_text(r.display().to_string());
                     if resp.clicked() && !here {
-                        acts.push(Act::OpenPath(r.clone()));
+                        acts.push(Act::Switch(r.clone()));
                     }
                 }
             }
@@ -3639,6 +3688,7 @@ impl App {
             "editsigned" => Act::EditSigned(true),
             // Opens the print dialog.
             "print" => Act::Print,
+            "switch" => Act::Switch(PathBuf::from(arg)),
             "placesig" => {
                 let mut it = arg.split(',');
                 let x = it.next().and_then(|v| v.parse().ok()).unwrap_or(40.0);
